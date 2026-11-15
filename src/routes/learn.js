@@ -4,6 +4,7 @@ const pool = require('../db');
 const s3 = require('../s3');
 const { requireUser } = require('../auth');
 const { razorpayKeys, razorpayCreateOrder } = require('../razorpay');
+const { certificatePdf } = require('../certificatePdf');
 
 const router = Router();
 
@@ -40,7 +41,7 @@ const loadCourse = async (id) => (await pool.query(
 
 // a current, paid enrolment of this shopper in this course (or none)
 const activeEnrollment = async (customerId, courseId) => (await pool.query(
-  `SELECT id, enrolled_at, expires_at, doubt_support_included FROM enrollments
+  `SELECT id, enrolled_at, expires_at, doubt_support_included, certificate_included FROM enrollments
     WHERE customer_id = $1 AND course_id = $2 AND payment_status = 'completed' AND is_active
       AND (expires_at IS NULL OR expires_at > NOW())
     ORDER BY enrolled_at DESC LIMIT 1`, [customerId, courseId])).rows[0];
@@ -244,6 +245,7 @@ router.get('/api/store/learn', requireUser, async (req, res) => {
 // ---------- progress ----------
 // A lesson counts as watched once the student has played 60% of it; only then does the next lesson open.
 const WATCHED_AT = 0.6;
+const CERTIFICATE_AT = 80; // % of the course that has to be finished before a certificate can be requested
 
 /** the lessons of a course in the order they are taught, each with the student's progress and whether it is open yet */
 async function lessonsFor(courseId, enrollmentId) {
@@ -304,8 +306,14 @@ router.get('/api/store/learn/:courseId', requireUser, async (req, res) => {
     if (!course) return res.status(404).json({ error: 'Course not found' });
     const l = await lessonsFor(courseId, enrollment.id);
     const mine = (await pool.query('SELECT rating, review_text FROM course_reviews WHERE course_id = $1 AND customer_id = $2', [courseId, req.customerId])).rows[0] || null;
+    // the software this course uses, with its download link and install steps (links are for enrolled students only)
+    const software = (await pool.query('SELECT id, name, description, platform, is_required, version, download_url, installation_instructions FROM course_software_links WHERE course_id = $1 ORDER BY position, id', [courseId])).rows;
+    const cert = (await pool.query('SELECT status, certificate_number, full_name, title, delivery_email, requested_at, issued_at FROM certificates WHERE enrollment_id = $1', [enrollment.id])).rows[0] || null;
     await pool.query('UPDATE enrollments SET last_accessed_at = NOW() WHERE id = $1', [enrollment.id]);
-    res.json({ course, enrollment: { expires_at: enrollment.expires_at }, progress: l.progress, watched_at: WATCHED_AT * 100, my_review: mine, doubt_support: Boolean(enrollment.doubt_support_included), sections: l.sections });
+    res.json({ course, enrollment: { expires_at: enrollment.expires_at }, progress: l.progress, watched_at: WATCHED_AT * 100, my_review: mine,
+      software,
+      certificate: enrollment.certificate_included ? { required: CERTIFICATE_AT, eligible: l.progress.percent >= CERTIFICATE_AT, ...(cert || { status: null }) } : null,
+      doubt_support: Boolean(enrollment.doubt_support_included), sections: l.sections });
   } catch (err) {
     console.error('GET /api/store/learn/:courseId failed:', err.message);
     res.status(500).json({ error: 'Failed to load the course' });
@@ -500,6 +508,110 @@ router.post('/api/store/learn/:courseId/doubts', requireUser, async (req, res) =
   } catch (err) {
     console.error('POST /api/store/learn/:courseId/doubts failed:', err.message);
     res.status(500).json({ error: 'Could not send your question. Please try again.' });
+  }
+});
+
+// ---------- certificate (packages with a certificate only) ----------
+const TITLES = ['Mr.', 'Ms.', 'Mrs.', 'Dr.'];
+const LATIN_NAME = /^[A-Za-z\u00C0-\u00FF][A-Za-z\u00C0-\u00FF .'-]*$/; // the certificate is printed with standard fonts
+
+/**
+ * @openapi
+ * /api/store/learn/{courseId}/certificate:
+ *   post:
+ *     tags: [Store]
+ *     summary: Ask the instructor for the course certificate (needs a package with a certificate and 80% of the course finished)
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - { in: path, name: courseId, required: true, schema: { type: integer } }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema: { type: object, required: [title, full_name, delivery_email], properties: { title: { type: string, enum: [Mr., Ms., Mrs., Dr.] }, full_name: { type: string }, delivery_email: { type: string } } }
+ *     responses:
+ *       201: { description: The request, waiting for the instructor }
+ *       400: { description: Invalid details }
+ *       403: { description: No certificate in the package, or less than 80% finished }
+ *       409: { description: Already requested }
+ */
+router.post('/api/store/learn/:courseId/certificate', requireUser, async (req, res) => {
+  const courseId = Number(req.params.courseId);
+  if (!Number.isInteger(courseId) || courseId < 1) return res.status(404).json({ error: 'Course not found' });
+  const title = String(req.body?.title ?? '').trim();
+  const name = String(req.body?.full_name ?? '').trim().replace(/\s+/g, ' ');
+  const email = String(req.body?.delivery_email ?? '').trim();
+  const fields = {};
+  if (!TITLES.includes(title)) fields.title = 'Choose Mr., Ms., Mrs. or Dr.';
+  if (name.length < 2 || name.length > 80) fields.full_name = 'Write your full name (2 to 80 letters).';
+  else if (!LATIN_NAME.test(name)) fields.full_name = 'Please write the name in English letters, exactly as it should be printed.';
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 255) fields.delivery_email = 'Enter a valid email address.';
+  if (Object.keys(fields).length) return res.status(400).json({ error: Object.values(fields)[0], fields });
+  try {
+    const e = await activeEnrollment(req.customerId, courseId);
+    if (!e) return res.status(403).json({ error: 'You are not enrolled in this course, or your access has ended.' });
+    if (!e.certificate_included) return res.status(403).json({ error: 'A certificate is not included in your package.' });
+    const l = await lessonsFor(courseId, e.id);
+    if (l.progress.percent < CERTIFICATE_AT) return res.status(403).json({ error: `Finish ${CERTIFICATE_AT}% of the course to request your certificate. You are at ${l.progress.percent}%.` });
+    const made = await pool.query(
+      `INSERT INTO certificates (enrollment_id, status, title, full_name, delivery_email, requested_at) VALUES ($1, 'requested', $2, $3, $4, NOW())
+       ON CONFLICT (enrollment_id) DO NOTHING RETURNING status, title, full_name, delivery_email, requested_at`,
+      [e.id, title, name, email]
+    );
+    if (!made.rows[0]) return res.status(409).json({ error: 'You have already requested your certificate.' });
+    res.status(201).json(made.rows[0]);
+  } catch (err) {
+    console.error('POST /api/store/learn/:courseId/certificate failed:', err.message);
+    res.status(500).json({ error: 'Could not send your request. Please try again.' });
+  }
+});
+
+/**
+ * @openapi
+ * /api/store/learn/{courseId}/certificate/download:
+ *   get:
+ *     tags: [Store]
+ *     summary: Download your certificate (only after the instructor has approved it)
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - { in: path, name: courseId, required: true, schema: { type: integer } }
+ *     responses:
+ *       200: { description: The certificate as a PDF }
+ *       403: { description: Not enrolled }
+ *       404: { description: Not issued yet }
+ */
+router.get('/api/store/learn/:courseId/certificate/download', requireUser, async (req, res) => {
+  const courseId = Number(req.params.courseId);
+  if (!Number.isInteger(courseId) || courseId < 1) return res.status(404).json({ error: 'Course not found' });
+  try {
+    // a certificate that was issued stays downloadable even after the course access has ended
+    const row = (await pool.query(
+      `SELECT cert.certificate_number, cert.full_name, cert.title, cert.issued_at, cert.certificate_url, c.title AS course
+         FROM certificates cert JOIN enrollments e ON e.id = cert.enrollment_id JOIN courses c ON c.id = e.course_id
+        WHERE e.customer_id = $1 AND e.course_id = $2 AND e.payment_status = 'completed' AND cert.status = 'issued'
+        ORDER BY cert.issued_at DESC LIMIT 1`, [req.customerId, courseId])).rows[0];
+    if (!row) return res.status(404).json({ error: 'Your certificate has not been issued yet.' });
+    const safe = String(row.certificate_number).replace(/[^A-Za-z0-9._-]+/g, '_');
+    res.setHeader('Cache-Control', 'private, no-store');
+    const send = (body, type, ext) => {
+      res.setHeader('Content-Type', type);
+      res.setHeader('Content-Disposition', `attachment; filename="${safe}.${ext}"`);
+      return res.send(body);
+    };
+    const extOf = (type) => ({ 'application/pdf': 'pdf', 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp' }[String(type).split(';')[0]] || 'pdf');
+    if (row.certificate_url && row.certificate_url.startsWith('s3://')) { // the file the instructor uploaded
+      const f = await s3.getPrivate(row.certificate_url);
+      return send(f.body, f.contentType, extOf(f.contentType));
+    }
+    if (row.certificate_url) { // a file from the old site
+      const file = await fetch(await s3.freshUrl(row.certificate_url));
+      if (file.ok) { const type = file.headers.get('content-type') || 'application/pdf'; return send(Buffer.from(await file.arrayBuffer()), type, extOf(type)); }
+    }
+    // issued without a file: a certificate drawn from the approved details
+    return send(await certificatePdf({ title: row.title, name: row.full_name, course: row.course, number: row.certificate_number, issuedAt: row.issued_at }), 'application/pdf', 'pdf');
+  } catch (err) {
+    console.error('GET /api/store/learn/:courseId/certificate/download failed:', err.message);
+    res.status(500).json({ error: 'Could not prepare your certificate. Please try again.' });
   }
 });
 

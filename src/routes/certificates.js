@@ -1,5 +1,7 @@
 const { Router } = require('express');
+const multer = require('multer');
 const pool = require('../db');
+const s3 = require('../s3');
 
 const router = Router();
 const STATUSES = ['requested', 'issued', 'not_requested'];
@@ -92,6 +94,131 @@ router.get('/api/certificates', async (req, res) => {
   } catch (err) {
     console.error('GET /api/certificates failed:', err.message);
     res.status(500).json({ error: 'Failed to fetch certificates' });
+  }
+});
+
+// ---------- issuing: the instructor uploads the certificate file ----------
+const FILE_TYPES = { pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp' };
+const MAX_MB = 10;
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_MB * 1024 * 1024, files: 1 } });
+
+// reads the "file" field and checks that it really is a PDF or image (by its first bytes, not just its name)
+function takeFile(req, res, next) {
+  upload.single('file')(req, res, (err) => {
+    if (err) return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? `The file is larger than ${MAX_MB} MB` : err.message });
+    const f = req.file;
+    if (!f) return res.status(400).json({ error: 'Choose the certificate file (PDF or image) to upload' });
+    const ext = (f.originalname.split('.').pop() || '').toLowerCase();
+    const b = f.buffer;
+    const magic = { pdf: b.subarray(0, 5).toString() === '%PDF-', png: b.subarray(1, 4).toString() === 'PNG', jpg: b[0] === 0xff && b[1] === 0xd8, jpeg: b[0] === 0xff && b[1] === 0xd8, webp: b.subarray(0, 4).toString() === 'RIFF' && b.subarray(8, 12).toString() === 'WEBP' };
+    if (!FILE_TYPES[ext] || !magic[ext]) return res.status(400).json({ error: 'The certificate must be a PDF, PNG, JPG or WEBP file' });
+    req.certFile = { ext, buffer: b, contentType: FILE_TYPES[ext] };
+    next();
+  });
+}
+
+async function saveFile(enrollmentId, file) {
+  return s3.putPrivate(`certificates/${enrollmentId}-${Date.now()}.${file.ext}`, file.buffer, file.contentType);
+}
+
+/**
+ * @openapi
+ * /api/certificates/{enrollmentId}/issue:
+ *   put:
+ *     tags: [Certificates]
+ *     summary: Approve a student's certificate request by uploading the certificate (PDF or image). The student can then download it.
+ *     parameters:
+ *       - { in: path, name: enrollmentId, required: true, schema: { type: integer } }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema: { type: object, required: [file], properties: { file: { type: string, format: binary, description: "PDF, PNG, JPG or WEBP, up to 10 MB" } } }
+ *     responses:
+ *       200: { description: The certificate, now issued }
+ *       400: { description: No file, wrong type or too large }
+ *       404: { description: No request waiting for this enrolment }
+ *       409: { description: Already issued }
+ */
+router.put('/api/certificates/:enrollmentId/issue', takeFile, async (req, res) => {
+  const id = Number(req.params.enrollmentId);
+  if (!Number.isInteger(id) || id < 1) return res.status(404).json({ error: 'Certificate request not found' });
+  try {
+    const cur = (await pool.query('SELECT status FROM certificates WHERE enrollment_id = $1', [id])).rows[0];
+    if (!cur) return res.status(404).json({ error: 'This student has not requested a certificate' });
+    if (cur.status === 'issued') return res.status(409).json({ error: 'This certificate was already issued' });
+    const ref = await saveFile(id, req.certFile);
+    const { rows } = await pool.query(
+      `UPDATE certificates SET status = 'issued', certificate_number = $2, issued_at = NOW(), certificate_url = $3
+        WHERE enrollment_id = $1 AND status = 'requested' RETURNING enrollment_id, status, certificate_number, issued_at`,
+      [id, `CERT-${Date.now()}-${id}`, ref]
+    );
+    if (!rows[0]) { await s3.deletePrivate(ref).catch(() => {}); return res.status(409).json({ error: 'This certificate was already issued' }); }
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('PUT /api/certificates/:enrollmentId/issue failed:', err.message);
+    res.status(500).json({ error: 'Could not save the certificate. Please try again.' });
+  }
+});
+
+/**
+ * @openapi
+ * /api/certificates/{enrollmentId}/file:
+ *   put:
+ *     tags: [Certificates]
+ *     summary: Replace the file of a certificate that was already issued
+ *     parameters:
+ *       - { in: path, name: enrollmentId, required: true, schema: { type: integer } }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema: { type: object, required: [file], properties: { file: { type: string, format: binary } } }
+ *     responses:
+ *       200: { description: Saved }
+ *       404: { description: Not issued }
+ *   get:
+ *     tags: [Certificates]
+ *     summary: Open the certificate file of an issued certificate
+ *     parameters:
+ *       - { in: path, name: enrollmentId, required: true, schema: { type: integer } }
+ *     responses:
+ *       200: { description: The file }
+ *       404: { description: No file }
+ */
+router.put('/api/certificates/:enrollmentId/file', takeFile, async (req, res) => {
+  const id = Number(req.params.enrollmentId);
+  if (!Number.isInteger(id) || id < 1) return res.status(404).json({ error: 'Certificate not found' });
+  try {
+    const cur = (await pool.query("SELECT certificate_url FROM certificates WHERE enrollment_id = $1 AND status = 'issued'", [id])).rows[0];
+    if (!cur) return res.status(404).json({ error: 'This certificate has not been issued yet' });
+    const ref = await saveFile(id, req.certFile);
+    await pool.query('UPDATE certificates SET certificate_url = $2 WHERE enrollment_id = $1', [id, ref]);
+    if (String(cur.certificate_url || '').startsWith('s3://')) await s3.deletePrivate(cur.certificate_url).catch(() => {}); // the replaced file
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('PUT /api/certificates/:enrollmentId/file failed:', err.message);
+    res.status(500).json({ error: 'Could not save the certificate. Please try again.' });
+  }
+});
+
+router.get('/api/certificates/:enrollmentId/file', async (req, res) => {
+  const id = Number(req.params.enrollmentId);
+  if (!Number.isInteger(id) || id < 1) return res.status(404).json({ error: 'Certificate not found' });
+  try {
+    const cur = (await pool.query("SELECT certificate_url FROM certificates WHERE enrollment_id = $1 AND status = 'issued'", [id])).rows[0];
+    const url = cur && cur.certificate_url;
+    if (!url) return res.status(404).json({ error: 'No certificate file' });
+    if (url.startsWith('s3://')) {
+      const f = await s3.getPrivate(url);
+      res.setHeader('Content-Type', f.contentType);
+      res.setHeader('Content-Disposition', 'inline');
+      return res.send(f.body);
+    }
+    return res.redirect(await s3.freshUrl(url)); // a file from the old site: a fresh signed link
+  } catch (err) {
+    console.error('GET /api/certificates/:enrollmentId/file failed:', err.message);
+    res.status(500).json({ error: 'Could not open the certificate' });
   }
 });
 

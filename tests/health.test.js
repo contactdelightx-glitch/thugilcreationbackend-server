@@ -446,7 +446,9 @@ async function enrolTruth() {
       COUNT(*) FILTER (WHERE certificate_included)::int AS certs, COUNT(*) FILTER (WHERE doubt_support_included)::int AS doubts,
       COALESCE(SUM(certificate_fee + doubt_support_fee), 0)::float AS addons, COALESCE(SUM(certificate_fee), 0)::float AS cert_revenue
     FROM enrollments WHERE payment_status = 'completed'`)).rows[0];
-  return r;
+  // certificates students have had issued / have waiting (these change as people use the site)
+  const c = (await pool.query("SELECT COUNT(*) FILTER (WHERE status = 'issued')::int AS issued, COUNT(*) FILTER (WHERE status = 'requested')::int AS requested FROM certificates")).rows[0];
+  return { ...r, issued: c.issued, requested: c.requested };
 }
 
 test('students: only people who purchased a course are listed', async () => {
@@ -457,7 +459,7 @@ test('students: only people who purchased a course are listed', async () => {
   assert.strictEqual(sum.students, T.students); // not the 27 registered learners
   assert.strictEqual(sum.enrollments, T.payments);
   assert.strictEqual(sum.revenue, T.revenue);
-  assert.strictEqual(sum.certificatesIssued, 2);
+  assert.strictEqual(sum.certificatesIssued, T.issued);
   assert.strictEqual(sum.certificatesIncluded, T.certs);
   assert.strictEqual(sum.completed, 0);
 
@@ -703,19 +705,20 @@ test('certificates: list, filters and summary', async () => {
 
   const T = await enrolTruth();
   const sum = await get('/api/certificates/summary');
-  assert.deepStrictEqual(sum, { total: T.certs, issued: 2, requested: 0, notRequested: T.certs - 2, revenue: T.cert_revenue });
+  assert.deepStrictEqual(sum, { total: T.certs, issued: T.issued, requested: T.requested, notRequested: T.certs - T.issued - T.requested, revenue: T.cert_revenue });
 
   const all = await get('/api/certificates?limit=100');
   assert.strictEqual(all.total, T.certs);
   assert.ok(all.data.every((r) => r.student_email && r.course_title));
-  assert.deepStrictEqual(all.data.map((r) => r.status), ['issued', 'issued', ...Array(T.certs - 2).fill('not_requested')]); // issued before not requested
+  assert.deepStrictEqual(all.data.map((r) => r.status), [...Array(T.requested).fill('requested'), ...Array(T.issued).fill('issued'), ...Array(T.certs - T.issued - T.requested).fill('not_requested')]); // requested first, then issued, then not requested
   const issued = all.data.filter((r) => r.status === 'issued');
-  assert.ok(issued.every((r) => r.certificate_number.startsWith('CERT-') && r.certificate_url && r.issued_at && r.name_on_certificate && r.delivery_email));
+  assert.ok(issued.every((r) => r.certificate_number.startsWith('CERT-') && r.issued_at && r.name_on_certificate && r.delivery_email));
+  assert.ok(issued.filter((r) => !r.certificate_number.endsWith(`-${r.enrollment_id}`)).every((r) => r.certificate_url), 'certificates from the old site keep their file link');
   assert.ok(all.data.filter((r) => r.status === 'not_requested').every((r) => !r.certificate_number && !r.certificate_url && r.certificate_fee === 1000));
 
-  assert.strictEqual((await get('/api/certificates?status=issued')).total, 2);
-  assert.strictEqual((await get('/api/certificates?status=not_requested')).total, T.certs - 2);
-  assert.strictEqual((await get('/api/certificates?status=requested')).total, 0);
+  assert.strictEqual((await get('/api/certificates?status=issued')).total, T.issued);
+  assert.strictEqual((await get('/api/certificates?status=not_requested')).total, T.certs - T.issued - T.requested);
+  assert.strictEqual((await get('/api/certificates?status=requested')).total, T.requested);
   assert.strictEqual((await get(`/api/certificates?search=${issued[0].certificate_number}`)).total, 1);
   assert.strictEqual((await get('/api/certificates?search=zzzz-nothing')).total, 0);
   assert.strictEqual((await get('/api/certificates?search=saree')).total, T.certs); // matches the course title
@@ -1360,6 +1363,10 @@ test('course enrolment: pay for a package, get access to the lessons, others are
     assert.strictEqual(learn.status, 200);
     const body = await learn.json();
     assert.ok(body.sections.length > 0 && body.sections[0].videos[0].url, 'the enrolled student gets the lessons with their video links');
+    // the course's software, with download links, is for enrolled students only
+    assert.ok(Array.isArray(body.software) && body.software.length > 0 && body.software.every((x) => x.name && x.download_url), 'the student gets the software with its download links');
+    assert.ok(!JSON.stringify(pub).includes('drive.google.com') && !JSON.stringify(pub.software || []).includes('download_url'), 'the public course page never shows the download links');
+
     // ---- progress: a lesson is done at 60%, then the next one opens ----
     const flat = body.sections.flatMap((s) => s.videos);
     assert.ok(flat[0].locked === false && flat[0].url, 'the first lesson is open');
@@ -1423,6 +1430,72 @@ test('course enrolment: pay for a package, get access to the lessons, others are
     assert.strictEqual((await fetch(`${base}/api/store/learn/${course.id}`, { headers: O })).status, 403, 'not enrolled: no lessons');
     assert.strictEqual((await fetch(`${base}/api/store/learn/${course.id}`)).status, 401);
     assert.strictEqual((await (await fetch(`${base}/api/store/learn`, { headers: A })).json()).data.length, 1);
+    // ---- certificate: request at 80%, the instructor approves, the student downloads ----
+    const certReq = (body, h = A) => fetch(`${base}/api/store/learn/${course.id}/certificate`, { method: 'POST', headers: h, body: JSON.stringify(body) });
+    const goodReq = { title: 'Ms.', full_name: 'Priya Lakshmi', delivery_email: 'priya@example.com' };
+    const certInfo = async () => (await (await fetch(`${base}/api/store/learn/${course.id}`, { headers: A })).json()).certificate;
+    const before = await certInfo();
+    assert.deepStrictEqual([before.required, before.eligible, before.status], [80, false, null], 'a Pro package has a certificate, not yet allowed');
+    assert.strictEqual((await certReq(goodReq)).status, 403, 'under 80% finished: no request');
+    // finish 80% of the lessons
+    const need = Math.ceil(flat.length * 0.8);
+    for (const v of flat.slice(0, need)) await pool.query('INSERT INTO enrollment_video_progress (enrollment_id, video_id, duration_seconds, position_seconds, max_position_seconds, last_played_at, is_completed) VALUES ($1,$2,100,100,100,NOW(),TRUE) ON CONFLICT (enrollment_id, video_id) DO UPDATE SET is_completed = TRUE', [enrollmentId, v.id]);
+    assert.strictEqual((await certInfo()).eligible, true, 'at 80% the certificate can be requested');
+    assert.strictEqual((await certReq(goodReq, json)).status, 401);
+    assert.strictEqual((await certReq(goodReq, O)).status, 403, 'not enrolled');
+    assert.strictEqual((await certReq({ ...goodReq, title: 'Lord' })).status, 400);
+    assert.strictEqual((await certReq({ ...goodReq, full_name: 'பிரியா' })).status, 400, 'only English letters are printed');
+    assert.strictEqual((await certReq({ ...goodReq, full_name: 'A' })).status, 400);
+    assert.strictEqual((await certReq({ ...goodReq, delivery_email: 'not-an-email' })).status, 400);
+    assert.strictEqual((await fetch(`${base}/api/store/learn/${course.id}/certificate/download`, { headers: A })).status, 404, 'nothing to download before approval');
+    const requested = await certReq({ ...goodReq, full_name: '  Priya   Lakshmi ' });
+    assert.strictEqual(requested.status, 201);
+    assert.deepStrictEqual([(await requested.json()).status, (await certInfo()).status, (await certInfo()).full_name], ['requested', 'requested', 'Priya Lakshmi']);
+    assert.strictEqual((await certReq(goodReq)).status, 409, 'one request per enrolment');
+    assert.strictEqual((await fetch(`${base}/api/store/learn/${course.id}/certificate/download`, { headers: A })).status, 404, 'still waiting for the instructor');
+    // the instructor approves it in the admin
+    const upload = (name, bytes, type) => { const f = new FormData(); f.append('file', new Blob([bytes], { type }), name); return f; };
+    const PDF = Buffer.from('%PDF-1.4\n% a tiny test certificate\n%%EOF\n');
+    assert.strictEqual((await fetch(`${base}/api/certificates/999999999/issue`, { method: 'PUT', body: upload('c.pdf', PDF, 'application/pdf') })).status, 404);
+    assert.strictEqual((await fetch(`${base}/api/certificates/${enrollmentId}/issue`, { method: 'PUT' })).status, 400, 'a file is required to approve');
+    assert.strictEqual((await fetch(`${base}/api/certificates/${enrollmentId}/issue`, { method: 'PUT', body: upload('c.pdf', Buffer.from('this is not a pdf'), 'application/pdf') })).status, 400, 'a fake PDF is refused');
+    assert.strictEqual((await fetch(`${base}/api/certificates/${enrollmentId}/issue`, { method: 'PUT', body: upload('c.exe', PDF, 'application/octet-stream') })).status, 400, 'wrong file type');
+    assert.strictEqual((await certInfo()).status, 'requested', 'refused uploads change nothing');
+    const issued = await fetch(`${base}/api/certificates/${enrollmentId}/issue`, { method: 'PUT', body: upload('my certificate.pdf', PDF, 'application/pdf') });
+    assert.strictEqual(issued.status, 200);
+    const issuedBody = await issued.json();
+    assert.ok(issuedBody.status === 'issued' && /^CERT-\d+-\d+$/.test(issuedBody.certificate_number));
+    assert.strictEqual((await fetch(`${base}/api/certificates/${enrollmentId}/issue`, { method: 'PUT', body: upload('c.pdf', PDF, 'application/pdf') })).status, 409, 'cannot be issued twice');
+    const info = await certInfo();
+    assert.deepStrictEqual([info.status, info.certificate_number], ['issued', issuedBody.certificate_number]);
+    const pdf = await fetch(`${base}/api/store/learn/${course.id}/certificate/download`, { headers: A });
+    assert.strictEqual(pdf.status, 200);
+    assert.strictEqual(pdf.headers.get('content-type'), 'application/pdf');
+    assert.match(pdf.headers.get('content-disposition'), /^attachment; filename="CERT-\d+-\d+\.pdf"$/);
+    const got = Buffer.from(await pdf.arrayBuffer());
+    assert.ok(got.equals(PDF), 'the student downloads exactly the file the instructor uploaded');
+    const stored = (await pool.query('SELECT certificate_url FROM certificates WHERE enrollment_id = $1', [enrollmentId])).rows[0].certificate_url;
+    assert.match(stored, /^s3:\/\/[^/]+\/certificates\/\d+-\d+\.pdf$/, 'saved in S3 under certificates/');
+    const adminFile = await fetch(`${base}/api/certificates/${enrollmentId}/file`);
+    assert.strictEqual(adminFile.status, 200);
+    assert.ok(Buffer.from(await adminFile.arrayBuffer()).equals(PDF), 'the admin can open the same file');
+    const PNG = Buffer.concat([Buffer.from([0x89]), Buffer.from('PNG\r\n\x1a\n'), Buffer.alloc(20)]);
+    assert.strictEqual((await fetch(`${base}/api/certificates/${enrollmentId}/file`, { method: 'PUT', body: upload('new.png', PNG, 'image/png') })).status, 200, 'the file can be replaced');
+    const png = await fetch(`${base}/api/store/learn/${course.id}/certificate/download`, { headers: A });
+    assert.match(png.headers.get('content-disposition'), /\.png"$/);
+    assert.ok(Buffer.from(await png.arrayBuffer()).equals(PNG));
+    await new Promise((r) => setTimeout(r, 200));
+    // clean-up: the first file went when it was replaced; remove the second (the test's own file) from S3 too
+    const finalRef = (await pool.query('SELECT certificate_url FROM certificates WHERE enrollment_id = $1', [enrollmentId])).rows[0].certificate_url;
+    await require('../src/s3').deletePrivate(finalRef).catch(() => {});
+    await require('../src/s3').deletePrivate(stored).catch(() => {});
+    assert.strictEqual((await fetch(`${base}/api/store/learn/${course.id}/certificate/download`, { headers: O })).status, 404, 'not someone else\'s certificate');
+    assert.strictEqual((await fetch(`${base}/api/store/learn/${course.id}/certificate/download`)).status, 401);
+    // a package without a certificate gets none of this
+    await pool.query('UPDATE enrollments SET certificate_included = FALSE WHERE id = $1', [enrollmentId]);
+    assert.strictEqual((await certInfo()), null, 'no certificate section for a package without one');
+    await pool.query('UPDATE enrollments SET certificate_included = TRUE WHERE id = $1', [enrollmentId]);
+
     // access ends with the expiry date
     await pool.query("UPDATE enrollments SET expires_at = NOW() - INTERVAL '1 day' WHERE id = $1", [enrollmentId]);
     assert.strictEqual((await fetch(`${base}/api/store/learn/${course.id}`, { headers: A })).status, 403, 'expired access is closed');

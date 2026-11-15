@@ -1,5 +1,5 @@
 require('dotenv').config({ quiet: true });
-const { S3Client, ListObjectsV2Command, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, ListObjectsV2Command, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const { AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_BUCKET_NAME, AWS_REGION } = process.env;
@@ -127,5 +127,27 @@ async function freshUrl(url) {
   }
 }
 
+// ---------- private files (the certificates students download) ----------
+// Stored under certificates/ in the configured bucket and never given a public link: the server hands them out
+// only to the student they belong to (or to the admin). A file is referred to as "s3://<bucket>/<key>".
+async function putPrivate(key, body, contentType) {
+  if (!client) throw new Error('S3 is not configured');
+  await client.send(new PutObjectCommand({ Bucket: AWS_BUCKET_NAME, Key: key, Body: body, ContentType: contentType }));
+  return `s3://${AWS_BUCKET_NAME}/${key}`;
+}
+const parseRef = (ref) => { const m = /^s3:\/\/([^/]+)\/(.+)$/.exec(String(ref || '')); return m ? { bucket: m[1], key: m[2] } : null; };
+/** @returns { body: Buffer, contentType } of a file saved with putPrivate, or null when `ref` is not one of ours */
+async function getPrivate(ref) {
+  const p = parseRef(ref);
+  if (!p || !client) return null;
+  const r = await client.send(new GetObjectCommand({ Bucket: p.bucket, Key: p.key }));
+  return { body: Buffer.from(await r.Body.transformToByteArray()), contentType: r.ContentType || 'application/octet-stream' };
+}
+async function deletePrivate(ref) {
+  const p = parseRef(ref);
+  if (p && client) await client.send(new DeleteObjectCommand({ Bucket: p.bucket, Key: p.key }));
+}
+
 module.exports = {
+  putPrivate, getPrivate, deletePrivate,
   freshUrl, configured, listImages, uploadImage, isImage, warm, CONTENT_TYPES, COURSE_THUMBNAIL_FOLDER };
