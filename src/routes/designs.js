@@ -208,6 +208,7 @@ const oneOf = (list) => (v) => (list.includes(v) ? { value: v } : { error: `must
 const url = (v) => {
   const r = str(3000)(v);
   if (r.error) return r;
+  if (/\s/.test(r.value)) return { error: 'must be one link, without spaces' };
   return /^https?:\/\//i.test(r.value) ? r : { error: 'must start with http:// or https://' };
 };
 
@@ -233,8 +234,20 @@ const email = (v) => {
   if (r.error) return r;
   return EMAIL.test(r.value) ? { value: r.value.toLowerCase() } : { error: 'must be a valid email address' };
 };
+// a Full Set is made of several pictures (body, border, pallu ...): the links are kept in one field, separated by spaces
+const MAX_PARTS = 20;
+const urlList = (v) => {
+  const parts = String(v ?? '').trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return { error: 'is required' };
+  if (parts.length > MAX_PARTS) return { error: `can have at most ${MAX_PARTS} pictures` };
+  const bad = parts.find((u) => !/^https?:\/\//i.test(u));
+  if (bad) return { error: 'every picture link must start with http:// or https://' };
+  if (parts.join(' ').length > 6000) return { error: 'is too long' };
+  return { value: parts.join(' ') };
+};
 // extra fields that can be set when creating, but not edited afterwards
 const CREATE_ONLY = { designer_email: email, image_url: url, original_image_url: url };
+const CREATE_ONLY_FULL_SET = { ...CREATE_ONLY, image_url: urlList, original_image_url: urlList };
 
 /**
  * @openapi
@@ -262,7 +275,7 @@ router.post('/api/designs/:category', async (req, res) => {
   const cat = CATEGORIES[key];
   if (!cat) return res.status(400).json({ error: 'Unknown category' });
 
-  const schema = { ...SCHEMAS[key], ...CREATE_ONLY };
+  const schema = { ...SCHEMAS[key], ...(key === 'full_set' ? CREATE_ONLY_FULL_SET : CREATE_ONLY) };
   const body = req.body && typeof req.body === 'object' ? req.body : {};
 
   const unknown = Object.keys(body).filter((k) => !schema[k]);

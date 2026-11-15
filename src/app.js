@@ -18,6 +18,7 @@ const dashboardRoutes = require('./routes/dashboard');
 const storeRoutes = require('./routes/store');
 const authRoutes = require('./routes/auth');
 const checkoutRoutes = require('./routes/checkout');
+const learnRoutes = require('./routes/learn');
 const doubtRoutes = require('./routes/doubts');
 
 const app = express();
@@ -47,6 +48,7 @@ app.use(dashboardRoutes);
 app.use(storeRoutes);
 app.use(authRoutes);
 app.use(checkoutRoutes);
+app.use(learnRoutes);
 app.use(doubtRoutes);
 
 module.exports = app;

@@ -2,6 +2,8 @@ const { Router } = require('express');
 const crypto = require('crypto');
 const pool = require('../db');
 const { requireUser } = require('../auth');
+const { zipSync } = require('fflate');
+const { razorpayKeys, razorpayCreateOrder } = require('../razorpay');
 
 const router = Router();
 
@@ -10,27 +12,6 @@ const TABLES = {
   pallu: 'pallu_designs', border: 'border_designs', free_image: 'free_image_designs',
 };
 const MAX_ITEMS = 50;
-const razorpayBase = () => process.env.RAZORPAY_API_BASE || 'https://api.razorpay.com';
-
-function razorpayKeys() {
-  const id = process.env.RAZORPAY_KEY_ID;
-  const secret = process.env.RAZORPAY_KEY_SECRET;
-  if (!id || !secret) throw new Error('Razorpay keys are not set (RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET)');
-  return { id, secret };
-}
-
-async function razorpayCreateOrder({ amountPaise, receipt }) {
-  const { id, secret } = razorpayKeys();
-  const res = await fetch(`${razorpayBase()}/v1/orders`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Basic ${Buffer.from(`${id}:${secret}`).toString('base64')}` },
-    body: JSON.stringify({ amount: amountPaise, currency: 'INR', receipt }),
-  });
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(`Razorpay refused the order (${res.status}): ${body?.error?.description || 'no details'}`);
-  return body;
-}
-
 /**
  * @openapi
  * /api/store/checkout:
@@ -72,7 +53,7 @@ router.post('/api/store/checkout', requireUser, async (req, res) => {
     for (const { category, id } of list) {
       const nameCol = category === 'free_image' ? 'NULL::varchar' : 'name';
       const { rows } = await pool.query(
-        `SELECT id, ${nameCol} AS name, image_url, listing_rate::float AS listing_rate, final_price::float AS final_price FROM ${TABLES[category]} WHERE id = $1`, [id]
+        `SELECT id, ${nameCol} AS name, split_part(btrim(image_url), ' ', 1) AS image_url, listing_rate::float AS listing_rate, final_price::float AS final_price FROM ${TABLES[category]} WHERE id = $1`, [id]
       );
       if (!rows[0]) return res.status(400).json({ error: 'A design in the cart is no longer available. Please remove it and try again.' });
       items.push({ category, design_id: id, name: rows[0].name || 'Free design', image_url: rows[0].image_url, price: rows[0].listing_rate, final_price: rows[0].final_price });
@@ -147,7 +128,7 @@ router.post('/api/store/checkout/verify', requireUser, async (req, res) => {
 
     const found = await client.query('SELECT amount::float AS amount, items FROM checkout_sessions WHERE razorpay_order_id = $1 AND customer_id = $2 FOR UPDATE', [orderId, req.customerId]);
     const session = found.rows[0];
-    if (!session) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'No payment is waiting for this account' }); }
+    if (!session || !Array.isArray(session.items)) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'No payment is waiting for this account' }); }
 
     const user = (await client.query('SELECT phone FROM users WHERE customer_id = $1', [req.customerId])).rows[0];
     const order = (await client.query(
@@ -170,6 +151,190 @@ router.post('/api/store/checkout/verify', requireUser, async (req, res) => {
     res.status(500).json({ error: 'Your payment went through but we could not save the order. Please contact us with your payment id.' });
   } finally {
     client.release();
+  }
+});
+
+/**
+ * @openapi
+ * /api/store/orders/{id}:
+ *   get:
+ *     tags: [Store]
+ *     summary: One of the logged-in shopper's own orders, with its designs (for the purchase-complete page)
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - { in: path, name: id, required: true, schema: { type: integer } }
+ *     responses:
+ *       200: { description: "{ id, total, created_at, payment_id, items: [{ name, category, image_url, final_price }] }" }
+ *       401: { description: Not logged in }
+ *       404: { description: Not found, or not this shopper's order }
+ */
+router.get('/api/store/orders/:id', requireUser, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) return res.status(404).json({ error: 'Order not found' });
+  try {
+    const order = await pool.query(
+      `SELECT id, total::float AS total, payment_status, razorpay_payment_id AS payment_id, created_at
+         FROM orders WHERE id = $1 AND customer_id = $2`, [id, req.customerId]
+    );
+    if (!order.rowCount) return res.status(404).json({ error: 'Order not found' });
+    const items = await pool.query(
+      `SELECT design_name AS name, design_category AS category, split_part(btrim(image_url), ' ', 1) AS image_url, final_price::float AS final_price
+         FROM order_items WHERE order_id = $1 ORDER BY position`, [id]
+    );
+    res.json({ ...order.rows[0], items: items.rows });
+  } catch (err) {
+    console.error('GET /api/store/orders/:id failed:', err.message);
+    res.status(500).json({ error: 'Failed to load the order' });
+  }
+});
+
+/**
+ * The rows a shopper has bought, each with the design's ORIGINAL image (the full file, not the blurred preview).
+ * Falls back to the preview stored on the order when the design is gone or has no original.
+ */
+async function boughtItems(customerId, onlyItemId) {
+  const params = [customerId];
+  let extra = '';
+  if (onlyItemId) { params.push(onlyItemId); extra = 'AND i.id = $2'; }
+  const { rows } = await pool.query(
+    `SELECT i.id AS item_id, i.design_id, i.design_category AS category, i.design_name AS name, split_part(btrim(i.image_url), ' ', 1) AS preview_url,
+            o.id AS order_id, o.created_at AS purchased_at, rv.rating AS my_rating, rv.review AS my_review
+       FROM order_items i JOIN orders o ON o.id = i.order_id
+       LEFT JOIN saree_ratings rv ON rv.customer_id = o.customer_id AND rv.design_category = i.design_category AND rv.design_id = i.design_id
+      WHERE o.customer_id = $1 AND o.payment_status = 'captured' ${extra}
+      ORDER BY o.created_at DESC, o.id DESC, i.position
+      LIMIT 500`, params
+  );
+  const byCategory = {};
+  for (const r of rows) if (r.category && TABLES[r.category] && r.design_id) (byCategory[r.category] ||= new Set()).add(String(r.design_id));
+  const originals = {};
+  for (const [category, ids] of Object.entries(byCategory)) {
+    const found = await pool.query(`SELECT id, original_image_url FROM ${TABLES[category]} WHERE id = ANY($1::bigint[])`, [[...ids]]);
+    for (const d of found.rows) originals[`${category}:${d.id}`] = d.original_image_url;
+  }
+  // a design can have several original files (a Full Set keeps all its parts in one field, separated by spaces)
+  return rows.map(({ design_id, preview_url, ...r }) => {
+    const files = String(originals[`${r.category}:${design_id}`] || '').trim().split(/\s+/).filter(Boolean);
+    return { ...r, original_files: files.length ? files : [preview_url] };
+  });
+}
+
+/**
+ * @openapi
+ * /api/store/purchases:
+ *   get:
+ *     tags: [Store]
+ *     summary: The designs the logged-in shopper has bought, newest first, each with its original image
+ *     security: [{ bearerAuth: [] }]
+ *     responses:
+ *       200: { description: "{ data: [{ item_id, name, category, image_url (the original), order_id, purchased_at }] }" }
+ *       401: { description: Not logged in }
+ */
+router.get('/api/store/purchases', requireUser, async (req, res) => {
+  try {
+    const rows = await boughtItems(req.customerId);
+    res.json({ data: rows.map(({ original_files, ...r }) => ({ ...r, image_url: original_files[0], files: original_files.length })) });
+  } catch (err) {
+    console.error('GET /api/store/purchases failed:', err.message);
+    res.status(500).json({ error: 'Failed to load your purchases' });
+  }
+});
+
+/**
+ * @openapi
+ * /api/store/purchases/{itemId}/download:
+ *   get:
+ *     tags: [Store]
+ *     summary: Download the original design file of something the logged-in shopper has bought
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - { in: path, name: itemId, required: true, schema: { type: integer } }
+ *     responses:
+ *       200: { description: The file, as an attachment }
+ *       401: { description: Not logged in }
+ *       404: { description: Not bought by this shopper }
+ */
+router.get('/api/store/purchases/:itemId/download', requireUser, async (req, res) => {
+  const itemId = Number(req.params.itemId);
+  if (!Number.isInteger(itemId) || itemId < 1) return res.status(404).json({ error: 'Not found' });
+  try {
+    const [item] = await boughtItems(req.customerId, itemId);
+    if (!item) return res.status(404).json({ error: 'You have not bought this design' });
+    const safe = String(item.name || 'design').replace(/[^A-Za-z0-9._-]+/g, '_');
+    const extOf = (u) => (new URL(u).pathname.match(/\.([a-z0-9]{2,5})$/i) || [, 'bmp'])[1].toLowerCase();
+    res.setHeader('Cache-Control', 'private, no-store');
+    if (item.original_files.length === 1) {
+      const file = await fetch(item.original_files[0]);
+      if (!file.ok) return res.status(502).json({ error: 'The design file could not be fetched. Please try again.' });
+      res.setHeader('Content-Type', file.headers.get('content-type') || 'application/octet-stream');
+      res.setHeader('Content-Disposition', `attachment; filename="${safe}.${extOf(item.original_files[0])}"`);
+      return res.send(Buffer.from(await file.arrayBuffer()));
+    }
+    // several files: one zip, the files numbered in order
+    const entries = {};
+    for (const [n, url] of item.original_files.entries()) {
+      const file = await fetch(url);
+      if (!file.ok) return res.status(502).json({ error: 'A design file could not be fetched. Please try again.' });
+      entries[`${safe}-${n + 1}.${extOf(url)}`] = new Uint8Array(await file.arrayBuffer());
+    }
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${safe}.zip"`);
+    res.send(Buffer.from(zipSync(entries, { level: 6 })));
+  } catch (err) {
+    console.error('GET /api/store/purchases/:itemId/download failed:', err.message);
+    res.status(500).json({ error: 'Download failed. Please try again.' });
+  }
+});
+
+/**
+ * @openapi
+ * /api/store/purchases/{itemId}/review:
+ *   put:
+ *     tags: [Store]
+ *     summary: Write (or change) your review of a design you bought
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - { in: path, name: itemId, required: true, schema: { type: integer } }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [rating]
+ *             properties: { rating: { type: integer, minimum: 1, maximum: 5 }, review: { type: string, maxLength: 1000 } }
+ *     responses:
+ *       200: { description: "{ rating, review }" }
+ *       400: { description: Invalid rating or review }
+ *       401: { description: Not logged in }
+ *       404: { description: Not bought by this shopper }
+ */
+router.put('/api/store/purchases/:itemId/review', requireUser, async (req, res) => {
+  const itemId = Number(req.params.itemId);
+  const rating = Number(req.body?.rating);
+  const review = String(req.body?.review ?? '').trim();
+  if (!Number.isInteger(itemId) || itemId < 1) return res.status(404).json({ error: 'Not found' });
+  if (!Number.isInteger(rating) || rating < 1 || rating > 5) return res.status(400).json({ error: 'Choose 1 to 5 stars' });
+  if (review.length > 1000) return res.status(400).json({ error: 'The review can be at most 1000 characters' });
+  try {
+    const item = (await pool.query(
+      `SELECT i.design_id, i.design_category FROM order_items i JOIN orders o ON o.id = i.order_id
+        WHERE i.id = $1 AND o.customer_id = $2 AND o.payment_status = 'captured'`, [itemId, req.customerId]
+    )).rows[0];
+    if (!item) return res.status(404).json({ error: 'You can only review designs you have bought' });
+    if (!item.design_id || !item.design_category) return res.status(400).json({ error: 'This design can no longer be reviewed' });
+    const saved = (await pool.query(
+      `INSERT INTO saree_ratings (design_id, design_category, rating, review, customer_id)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (customer_id, design_category, design_id) WHERE customer_id IS NOT NULL AND design_id IS NOT NULL
+       DO UPDATE SET rating = EXCLUDED.rating, review = EXCLUDED.review, updated_at = NOW()
+       RETURNING rating, review`,
+      [item.design_id, item.design_category, rating, review || null, req.customerId]
+    )).rows[0];
+    res.json(saved);
+  } catch (err) {
+    console.error('PUT /api/store/purchases/:itemId/review failed:', err.message);
+    res.status(500).json({ error: 'Could not save your review. Please try again.' });
   }
 });
 

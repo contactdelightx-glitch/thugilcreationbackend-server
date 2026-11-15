@@ -1,6 +1,7 @@
 const { Router } = require('express');
 const pool = require('../db');
 const s3 = require('../s3');
+const { packagesOf } = require('./learn');
 
 const router = Router();
 
@@ -32,7 +33,9 @@ const publicSelect = (key) => {
   const name = key === 'free_image' ? 'NULL::varchar' : 'name';
   const have = HAS[key === 'full_set' || key === 'free_image' ? key : 'standard'];
   const specs = SPEC_COLUMNS.map((c) => (have.includes(c) ? c : `NULL::${TYPES[c] || 'varchar'} AS ${c}`)).join(', ');
-  return `SELECT id, product_id, ${name} AS name, image_url, label, listing_rate::float AS listing_rate,
+  // some designs (Full Set) keep several picture links in one field, separated by spaces: image_url is the first, images all of them
+  return `SELECT id, product_id, ${name} AS name, split_part(btrim(image_url), ' ', 1) AS image_url, regexp_split_to_array(btrim(image_url), '\\s+') AS images,
+                 label, listing_rate::float AS listing_rate,
                  final_price::float AS final_price, created_at, '${key}' AS category, ${specs}
             FROM ${table}`;
 };
@@ -167,7 +170,7 @@ router.get('/api/store/courses', async (req, res) => {
  *     parameters:
  *       - { in: path, name: id, required: true, schema: { type: integer } }
  *     responses:
- *       200: { description: "{ course, learningPoints, sections: [{ title, videos: [{ title, duration_seconds, is_free_preview }] }], software, reviews }" }
+ *       200: { description: "{ course, preview (the one free video), learningPoints, sections: [{ title, videos: [{ title, duration_seconds, is_free_preview }] }], software, reviews }" }
  *       404: { description: Not found, or not published }
  */
 router.get('/api/store/courses/:id', async (req, res) => {
@@ -188,7 +191,7 @@ router.get('/api/store/courses/:id', async (req, res) => {
       pool.query('SELECT text FROM course_learning_points WHERE course_id = $1 ORDER BY position, id', [id]),
       pool.query('SELECT id, title, description FROM course_sections WHERE course_id = $1 ORDER BY position, id', [id]),
       pool.query(
-        `SELECT v.section_id, v.title, v.duration_seconds, v.is_free_preview
+        `SELECT v.section_id, v.title, v.duration_seconds, v.is_free_preview, v.video_url, v.thumbnail_url, s.position AS section_position, v.position
            FROM course_videos v JOIN course_sections s ON s.id = v.section_id
           WHERE s.course_id = $1 ORDER BY v.position, v.id`, [id]),
       pool.query('SELECT name, platform, is_required FROM course_software_links WHERE course_id = $1 ORDER BY position, id', [id]),
@@ -200,6 +203,11 @@ router.get('/api/store/courses/:id', async (req, res) => {
 
     const bySection = new Map(sections.rows.map((s) => [String(s.id), { title: s.title, description: s.description, videos: [] }]));
     for (const v of videos.rows) bySection.get(String(v.section_id))?.videos.push({ title: v.title, duration_seconds: v.duration_seconds || 0, is_free_preview: v.is_free_preview });
+    // The one video a visitor may watch before buying: a lesson marked "free preview", or else a lesson titled "Demo".
+    // Only that single link is ever sent; the links of every other lesson stay private.
+    const inOrder = [...videos.rows].sort((a, b) => a.section_position - b.section_position || a.position - b.position);
+    const demo = inOrder.find((v) => v.is_free_preview && v.video_url) || inOrder.find((v) => /^demo\b/i.test(String(v.title).trim()) && v.video_url);
+    const preview = demo ? { title: demo.title, url: demo.video_url, poster: demo.thumbnail_url || null, duration_seconds: demo.duration_seconds || 0 } : null;
     const list = [...bySection.values()].map((s) => ({ ...s, duration_seconds: s.videos.reduce((n, v) => n + v.duration_seconds, 0) }));
     const rated = reviews.rows.filter((r) => r.rating);
     res.json({
@@ -212,6 +220,8 @@ router.get('/api/store/courses/:id', async (req, res) => {
         review_count: rated.length,
         avg_rating: rated.length ? Math.round((rated.reduce((n, r) => n + r.rating, 0) / rated.length) * 10) / 10 : null,
       },
+      preview,
+      packages: packagesOf(head.rows[0]),
       learningPoints: points.rows.map((p) => p.text),
       sections: list,
       software: software.rows,
@@ -220,6 +230,39 @@ router.get('/api/store/courses/:id', async (req, res) => {
   } catch (err) {
     console.error('GET /api/store/courses/:id failed:', err.message);
     res.status(500).json({ error: 'Failed to fetch the course' });
+  }
+});
+
+/**
+ * @openapi
+ * /api/store/free/{id}/download:
+ *   get:
+ *     tags: [Store]
+ *     summary: Download a free image design (no login needed; only designs priced 0)
+ *     parameters:
+ *       - { in: path, name: id, required: true, schema: { type: integer } }
+ *     responses:
+ *       200: { description: The file, as an attachment }
+ *       404: { description: Not a free design }
+ */
+router.get('/api/store/free/:id/download', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) return res.status(404).json({ error: 'Not found' });
+  try {
+    const row = (await pool.query(
+      `SELECT image_url, original_image_url FROM free_image_designs WHERE id = $1 AND final_price = 0`, [id]
+    )).rows[0];
+    if (!row) return res.status(404).json({ error: 'Not found' });
+    const url = String(row.original_image_url || row.image_url || '').trim().split(/\s+/)[0];
+    const file = await fetch(url);
+    if (!file.ok) return res.status(502).json({ error: 'The file could not be fetched. Please try again.' });
+    const ext = (new URL(url).pathname.match(/\.([a-z0-9]{2,5})$/i) || [, 'bmp'])[1].toLowerCase();
+    res.setHeader('Content-Type', file.headers.get('content-type') || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="free-design-${id}.${ext}"`);
+    res.send(Buffer.from(await file.arrayBuffer()));
+  } catch (err) {
+    console.error('GET /api/store/free/:id/download failed:', err.message);
+    res.status(500).json({ error: 'Download failed. Please try again.' });
   }
 });
 

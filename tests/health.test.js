@@ -354,7 +354,8 @@ test('orders: list, filters, summary and items', async () => {
   const get = async (path) => (await fetch(`${base}${path}`)).json();
 
   const all = await get('/api/orders?limit=5');
-  assert.strictEqual(all.total, 194);
+  const orderCount = (await pool.query('SELECT COUNT(*)::int AS n FROM orders')).rows[0].n; // real test payments add rows, so never hard-code this
+  assert.strictEqual(all.total, orderCount);
   assert.strictEqual(all.data.length, 5);
   assert.strictEqual(all.hasMore, true);
   assert.ok(new Date(all.data[0].created_at) >= new Date(all.data[4].created_at)); // newest first
@@ -366,21 +367,23 @@ test('orders: list, filters, summary and items', async () => {
   const b = await get('/api/orders?limit=7&offset=7');
   const both = await get('/api/orders?limit=14&offset=0');
   assert.deepStrictEqual([...a.data, ...b.data].map((o) => o.id), both.data.map((o) => o.id));
-  assert.strictEqual((await get(`/api/orders?limit=10&offset=194`)).hasMore, false);
+  assert.strictEqual((await get(`/api/orders?limit=10&offset=${orderCount}`)).hasMore, false);
 
   // search + status
   const one = await get('/api/orders?search=pay_T3pN');
   assert.ok(one.total >= 1 && one.data.some((o) => o.id === '151'));
-  assert.strictEqual((await get('/api/orders?status=captured')).total, 194);
+  const truth = (await pool.query("SELECT COUNT(*)::int AS n, COALESCE(SUM(total),0)::float AS revenue, COALESCE(SUM(platform_fee),0)::float AS fees FROM orders WHERE payment_status = 'captured'")).rows[0];
+  const itemsTruth = (await pool.query("SELECT COUNT(*)::int AS n FROM order_items i JOIN orders o ON o.id = i.order_id WHERE o.payment_status = 'captured'")).rows[0].n;
+  assert.strictEqual((await get('/api/orders?status=captured')).total, truth.n);
   assert.strictEqual((await get('/api/orders?status=failed')).total, 0);
   assert.strictEqual((await get('/api/orders?search=zzzz-nothing')).total, 0);
 
   // summary agrees with the data
   const s = await get('/api/orders/summary');
-  assert.strictEqual(s.orders, 194);
-  assert.strictEqual(s.itemsSold, 510);
-  assert.strictEqual(s.revenue, 62797);
-  assert.strictEqual(s.fees, 280);
+  assert.strictEqual(s.orders, orderCount);
+  assert.strictEqual(s.itemsSold, itemsTruth);
+  assert.strictEqual(s.revenue, truth.revenue);
+  assert.strictEqual(s.fees, truth.fees);
 
   // items of a multi-item order
   const items = await get('/api/orders/67/items');
@@ -430,30 +433,40 @@ test('orders: month trends for the KPI cards', async () => {
   for (let [y, m] = first.split('-').map(Number); `${y}-${String(m).padStart(2, '0')}` <= cur.currentMonth; m === 12 ? (y++, (m = 1)) : m++) {
     sum += (await get(`/api/orders/trends?month=${y}-${String(m).padStart(2, '0')}`)).metrics.orders.total;
   }
-  assert.strictEqual(sum, 194);
+  assert.strictEqual(sum, (await pool.query("SELECT COUNT(*)::int AS n FROM orders WHERE payment_status = 'captured'")).rows[0].n);
 
   assert.strictEqual((await fetch(`${base}/api/orders/trends?month=2026-13`)).status, 400);
   assert.strictEqual((await fetch(`${base}/api/orders/trends?month=abc`)).status, 400);
   assert.strictEqual((await fetch(`${base}/api/orders/trends?month=2999-01`)).status, 400);
 });
 
+// real test purchases add enrolments to the dev database, so these figures are read from it, never hard-coded
+async function enrolTruth() {
+  const r = (await pool.query(`SELECT COUNT(*)::int AS payments, COUNT(DISTINCT customer_id)::int AS students, COALESCE(SUM(amount_paid), 0)::float AS revenue,
+      COUNT(*) FILTER (WHERE certificate_included)::int AS certs, COUNT(*) FILTER (WHERE doubt_support_included)::int AS doubts,
+      COALESCE(SUM(certificate_fee + doubt_support_fee), 0)::float AS addons, COALESCE(SUM(certificate_fee), 0)::float AS cert_revenue
+    FROM enrollments WHERE payment_status = 'completed'`)).rows[0];
+  return r;
+}
+
 test('students: only people who purchased a course are listed', async () => {
   const get = async (path) => (await fetch(`${base}${path}`)).json();
+  const T = await enrolTruth();
 
   const sum = await get('/api/students/summary');
-  assert.strictEqual(sum.students, 12); // not the 27 registered learners
-  assert.strictEqual(sum.enrollments, 12);
-  assert.strictEqual(sum.revenue, 110988);
+  assert.strictEqual(sum.students, T.students); // not the 27 registered learners
+  assert.strictEqual(sum.enrollments, T.payments);
+  assert.strictEqual(sum.revenue, T.revenue);
   assert.strictEqual(sum.certificatesIssued, 2);
-  assert.strictEqual(sum.certificatesIncluded, 6);
+  assert.strictEqual(sum.certificatesIncluded, T.certs);
   assert.strictEqual(sum.completed, 0);
 
   const all = await get('/api/students?limit=100');
-  assert.strictEqual(all.total, 12);
-  assert.strictEqual(all.data.length, 12);
+  assert.strictEqual(all.total, T.students);
+  assert.strictEqual(all.data.length, T.students);
   assert.ok(!JSON.stringify(all).includes('password'));
   assert.ok(all.data.every((r) => r.enrollment_id && r.course_title && r.enrollment_count >= 1)); // everyone has a purchase
-  assert.ok(new Date(all.data[0].enrolled_at) >= new Date(all.data[11].enrolled_at)); // newest first
+  assert.ok(new Date(all.data[0].enrolled_at) >= new Date(all.data[all.data.length - 1].enrolled_at)); // newest first
 
   // an account that never bought a course is not a student
   const buyers = new Set(all.data.map((r) => r.customer_id));
@@ -461,7 +474,7 @@ test('students: only people who purchased a course are listed', async () => {
   assert.ok(nonBuyer);
   assert.strictEqual((await fetch(`${base}/api/students/${nonBuyer.customer_id}/enrollments`)).status, 404);
 
-  assert.ok((await get('/api/students?search=saree')).total === 12); // matches the course title
+  assert.ok((await get('/api/students?search=saree')).total === T.students); // matches the course title
   assert.strictEqual((await get('/api/students?search=meena')).total, 1);
   assert.strictEqual((await get('/api/students?search=zzzz-nothing')).total, 0);
 
@@ -470,7 +483,7 @@ test('students: only people who purchased a course are listed', async () => {
   const b = await get('/api/students?limit=5&offset=5');
   const both = await get('/api/students?limit=10&offset=0');
   assert.deepStrictEqual([...a.data, ...b.data].map((r) => r.customer_id), both.data.map((r) => r.customer_id));
-  assert.strictEqual((await get('/api/students?limit=10&offset=12')).hasMore, false);
+  assert.strictEqual((await get(`/api/students?limit=10&offset=${T.students}`)).hasMore, false);
 
   // details of a student who has a certificate
   const withCert = all.data.find((r) => r.certificate_status === 'issued');
@@ -484,24 +497,25 @@ test('students: only people who purchased a course are listed', async () => {
 
 test('course payments: list, filters, summary and trends', async () => {
   const get = async (path) => (await fetch(`${base}${path}`)).json();
+  const T = await enrolTruth();
 
   const sum = await get('/api/course-payments/summary');
-  assert.strictEqual(sum.payments, 12);
-  assert.strictEqual(sum.revenue, 110988);
-  assert.strictEqual(sum.average, 9249);
-  assert.strictEqual(sum.addOnRevenue, 6000 + 9000); // 6 certificates at 1,000 + 3 doubt support at 3,000
-  assert.strictEqual(sum.certificates, 6);
-  assert.strictEqual(sum.doubtSupport, 3);
+  assert.strictEqual(sum.payments, T.payments);
+  assert.strictEqual(sum.revenue, T.revenue);
+  assert.ok(Math.abs(sum.average - T.revenue / T.payments) < 1);
+  assert.strictEqual(sum.addOnRevenue, T.addons);
+  assert.strictEqual(sum.certificates, T.certs);
+  assert.strictEqual(sum.doubtSupport, T.doubts);
 
   const all = await get('/api/course-payments?limit=100');
-  assert.strictEqual(all.total, 12);
+  assert.strictEqual(all.total, T.payments);
   assert.ok(all.data.every((p) => p.razorpay_payment_id && p.course_title && p.student_email));
   assert.ok(new Date(all.data[0].enrolled_at) >= new Date(all.data[11].enrolled_at)); // newest first
   // every payment adds up: price - discount + certificate + doubt support = paid
   assert.ok(all.data.every((p) => Math.abs(Number(p.base_price) - Number(p.discount_amount) + Number(p.certificate_fee) + Number(p.doubt_support_fee) - Number(p.amount_paid)) < 0.01));
   assert.ok(!JSON.stringify(all).includes('password'));
 
-  assert.strictEqual((await get('/api/course-payments?status=completed')).total, 12);
+  assert.strictEqual((await get('/api/course-payments?status=completed')).total, T.payments);
   assert.strictEqual((await get('/api/course-payments?status=failed')).total, 0);
   assert.strictEqual((await get('/api/course-payments?search=meena')).total, 1);
   const one = all.data[3];
@@ -525,8 +539,8 @@ test('course payments: list, filters, summary and trends', async () => {
     const rev = t.metrics.revenue.current;
     assert.ok(rev.every((v, i) => i === 0 || v >= rev[i - 1])); // cumulative
   }
-  assert.strictEqual(n, 12);
-  assert.strictEqual(revenue, 110988);
+  assert.strictEqual(n, T.payments);
+  assert.strictEqual(revenue, T.revenue);
   assert.ok(cur.metrics.avg && cur.metrics.addons);
   assert.strictEqual((await fetch(`${base}/api/course-payments/trends?month=abc`)).status, 400);
   assert.strictEqual((await fetch(`${base}/api/course-payments/trends?month=2999-01`)).status, 400);
@@ -541,17 +555,19 @@ test('courses: list, summary and one course in full', async () => {
   assert.strictEqual(sum.sections, 39);
   assert.strictEqual(sum.videos, 90);
   assert.strictEqual(sum.durationSeconds, 64024 + 12321);
-  assert.strictEqual(sum.students, 12);
-  assert.strictEqual(sum.revenue, 110988);
-  assert.strictEqual(sum.reviews, 3);
-  assert.strictEqual(sum.avgRating, 5);
+  const T = await enrolTruth();
+  const R = (await pool.query("SELECT COUNT(*)::int AS n, ROUND(AVG(rating), 1)::float AS avg FROM course_reviews WHERE is_published AND course_id = 2")).rows[0]; // students add reviews, so read them
+  assert.strictEqual(sum.students, T.students);
+  assert.strictEqual(sum.revenue, T.revenue);
+  assert.strictEqual(sum.reviews, R.n);
+  assert.strictEqual(sum.avgRating, R.avg);
 
   const list = await get('/api/courses');
   assert.strictEqual(list.total, 2);
   assert.strictEqual(list.data[0].is_published, true); // published first
   const main = list.data.find((c) => c.id === '2');
   assert.deepStrictEqual([main.sections, main.videos, main.duration_seconds, main.resources, main.students, main.revenue, main.review_count, main.avg_rating],
-    [26, 62, 64024, 27, 12, 110988, 3, 5]);
+    [26, 62, 64024, 27, T.students, T.revenue, R.n, R.avg]);
   const draft = list.data.find((c) => c.id === '3');
   assert.deepStrictEqual([draft.sections, draft.videos, draft.students, draft.revenue, draft.review_count, draft.avg_rating], [13, 28, 0, 0, 0, null]);
   assert.strictEqual(draft.is_published, false);
@@ -563,7 +579,7 @@ test('courses: list, summary and one course in full', async () => {
   const full = await get('/api/courses/2');
   assert.strictEqual(full.course.id, '2');
   assert.strictEqual(full.course.title, main.title);
-  assert.deepStrictEqual([full.course.sections, full.course.videos, full.course.students, full.course.revenue], [26, 62, 12, 110988]);
+  assert.deepStrictEqual([full.course.sections, full.course.videos, full.course.students, full.course.revenue], [26, 62, T.students, T.revenue]);
   assert.strictEqual(full.sections.length, 26);
   assert.ok(full.sections.every((s, i) => i === 0 || s.position > full.sections[i - 1].position)); // in order
   assert.strictEqual(full.sections.reduce((n, s) => n + s.videos.length, 0), 62);
@@ -573,8 +589,8 @@ test('courses: list, summary and one course in full', async () => {
   assert.strictEqual(full.resources.length, 27);
   assert.ok(full.resources.every((r) => r.video_title && r.section_title));
   assert.strictEqual(full.software.length, 1);
-  assert.strictEqual(full.reviews.length, 3);
-  assert.ok(full.reviews.every((r) => r.reviewer && r.rating === 5));
+  assert.strictEqual(full.reviews.length, R.n);
+  assert.ok(full.reviews.every((r) => r.reviewer && r.rating >= 1 && r.rating <= 5));
   assert.strictEqual(full.promotions.length, 1);
   assert.ok(!JSON.stringify(full).includes('video_url')); // playback links are not sent to the page
 
@@ -685,23 +701,24 @@ test('course thumbnail upload rejects bad requests before reaching S3', async ()
 test('certificates: list, filters and summary', async () => {
   const get = async (path) => (await fetch(`${base}${path}`)).json();
 
+  const T = await enrolTruth();
   const sum = await get('/api/certificates/summary');
-  assert.deepStrictEqual(sum, { total: 6, issued: 2, requested: 0, notRequested: 4, revenue: 6000 });
+  assert.deepStrictEqual(sum, { total: T.certs, issued: 2, requested: 0, notRequested: T.certs - 2, revenue: T.cert_revenue });
 
   const all = await get('/api/certificates?limit=100');
-  assert.strictEqual(all.total, 6);
+  assert.strictEqual(all.total, T.certs);
   assert.ok(all.data.every((r) => r.student_email && r.course_title));
-  assert.deepStrictEqual(all.data.map((r) => r.status), ['issued', 'issued', 'not_requested', 'not_requested', 'not_requested', 'not_requested']); // issued before not requested
+  assert.deepStrictEqual(all.data.map((r) => r.status), ['issued', 'issued', ...Array(T.certs - 2).fill('not_requested')]); // issued before not requested
   const issued = all.data.filter((r) => r.status === 'issued');
   assert.ok(issued.every((r) => r.certificate_number.startsWith('CERT-') && r.certificate_url && r.issued_at && r.name_on_certificate && r.delivery_email));
   assert.ok(all.data.filter((r) => r.status === 'not_requested').every((r) => !r.certificate_number && !r.certificate_url && r.certificate_fee === 1000));
 
   assert.strictEqual((await get('/api/certificates?status=issued')).total, 2);
-  assert.strictEqual((await get('/api/certificates?status=not_requested')).total, 4);
+  assert.strictEqual((await get('/api/certificates?status=not_requested')).total, T.certs - 2);
   assert.strictEqual((await get('/api/certificates?status=requested')).total, 0);
   assert.strictEqual((await get(`/api/certificates?search=${issued[0].certificate_number}`)).total, 1);
   assert.strictEqual((await get('/api/certificates?search=zzzz-nothing')).total, 0);
-  assert.strictEqual((await get('/api/certificates?search=saree')).total, 6); // matches the course title
+  assert.strictEqual((await get('/api/certificates?search=saree')).total, T.certs); // matches the course title
 
   const a = await get('/api/certificates?limit=2&offset=0');
   const b = await get('/api/certificates?limit=2&offset=2');
@@ -1108,12 +1125,44 @@ test('shopper login and Razorpay checkout (throwaway user, a fake Razorpay serve
     const saved1 = (await pool.query('SELECT payment_status, total::float AS total, customer_id::text AS c FROM orders WHERE id = $1', [done.orderId])).rows[0];
     assert.deepStrictEqual([saved1.payment_status, saved1.total, saved1.c], ['captured', expected / 100, String(id)]);
     assert.strictEqual((await pool.query('SELECT COUNT(*)::int AS n FROM order_items WHERE order_id = $1', [done.orderId])).rows[0].n, 2);
+    const mine = await fetch(`${base}/api/store/orders/${done.orderId}`, { headers: auth });
+    assert.strictEqual(mine.status, 200);
+    const ord = await mine.json();
+    assert.deepStrictEqual([ord.total, ord.items.length, ord.payment_id], [expected / 100, 2, payId]);
+    assert.ok(ord.items.every((i) => i.name && i.image_url));
+    assert.strictEqual((await fetch(`${base}/api/store/orders/${done.orderId}`)).status, 401, 'login required');
+    assert.strictEqual((await fetch(`${base}/api/store/orders/999999999`, { headers: auth })).status, 404);
+    const pur = await (await fetch(`${base}/api/store/purchases`, { headers: auth })).json();
+    assert.strictEqual(pur.data.length, 2);
+    const originals = (await pool.query("SELECT original_image_url FROM border_designs WHERE id = ANY($1::bigint[])", [two.map((d) => d.id)])).rows.map((r) => r.original_image_url);
+    assert.ok(pur.data.every((d) => originals.includes(d.image_url)), 'the page gets the ORIGINAL image, not the blurred preview');
+    assert.strictEqual((await fetch(`${base}/api/store/purchases`)).status, 401);
+    const dl = await fetch(`${base}/api/store/purchases/${pur.data[0].item_id}/download`, { headers: auth });
+    assert.strictEqual(dl.status, 200);
+    assert.match(dl.headers.get('content-disposition'), /^attachment; filename="[^"]+\.bmp"$/);
+    assert.ok((await dl.arrayBuffer()).byteLength > 1000, 'the file has content');
+    assert.strictEqual((await fetch(`${base}/api/store/purchases/${pur.data[0].item_id}/download`)).status, 401);
+    assert.strictEqual((await fetch(`${base}/api/store/purchases/999999999/download`, { headers: auth })).status, 404);
+    // ---- reviews of what was bought ----
+    const itemId = pur.data[0].item_id;
+    const put = (iid, body, h = auth) => fetch(`${base}/api/store/purchases/${iid}/review`, { method: 'PUT', headers: h, body: JSON.stringify(body) });
+    assert.strictEqual((await put(itemId, { rating: 5 }, json)).status, 401);
+    assert.strictEqual((await put(itemId, { rating: 0 })).status, 400);
+    assert.strictEqual((await put(itemId, { rating: 6 })).status, 400);
+    assert.strictEqual((await put(itemId, { rating: 4, review: 'x'.repeat(1001) })).status, 400);
+    assert.strictEqual((await put(999999999, { rating: 5 })).status, 404, 'only bought designs can be reviewed');
+    assert.strictEqual((await put(itemId, { rating: 4, review: '  Lovely design  ' })).status, 200);
+    assert.strictEqual((await put(itemId, { rating: 5, review: 'Changed my mind' })).status, 200);
+    const mineNow = (await (await fetch(`${base}/api/store/purchases`, { headers: auth })).json()).data.find((d) => d.item_id === itemId);
+    assert.deepStrictEqual([mineNow.my_rating, mineNow.my_review], [5, 'Changed my mind']);
+    assert.strictEqual((await pool.query('SELECT COUNT(*)::int AS n FROM saree_ratings WHERE customer_id = $1', [id])).rows[0].n, 1, 'editing never makes a second review');
     const again = await (await post('/api/store/checkout/verify', { razorpay_order_id: session.orderId, razorpay_payment_id: payId, razorpay_signature: goodSig })).json();
     assert.ok(again.already && again.orderId === done.orderId, 'confirming twice does not create a second order');
 
     const rebuy = await post('/api/store/checkout', { items: [items[0]] });
     assert.strictEqual(rebuy.status, 409, 'a design already bought cannot be bought again');
   } finally {
+    await pool.query('DELETE FROM saree_ratings WHERE customer_id = $1', [id]);
     await pool.query('DELETE FROM orders WHERE customer_id = $1', [id]);
     await pool.query('DELETE FROM checkout_sessions WHERE customer_id = $1', [id]);
     await pool.query('DELETE FROM users WHERE customer_id = $1', [id]);
@@ -1149,6 +1198,9 @@ test('store: one course shows its syllabus but no video links, and drafts stay h
   assert.ok(r.course.title && r.sections.length > 0 && r.sections.every((s) => Array.isArray(s.videos)));
   assert.strictEqual(r.course.videos, r.sections.reduce((n, s) => n + s.videos.length, 0));
   const text = JSON.stringify(r);
+  const links = text.match(/https?:[^"]*\.m3u8/g) || [];
+  assert.ok(links.length <= 1, 'at most one video link (the free preview) is ever public');
+  if (r.preview) assert.ok(/m3u8|mp4/.test(r.preview.url) && r.preview.title);
   for (const secret of ['video_url', 'bunny_video_id', 'download_url', 'revenue', 'is_published']) assert.ok(!text.includes(secret), `${secret} must not be public`);
   const draft = (await pool.query('SELECT id FROM courses WHERE NOT is_published LIMIT 1')).rows[0];
   if (draft) assert.strictEqual((await fetch(`${base}/api/store/courses/${draft.id}`)).status, 404);
@@ -1167,4 +1219,220 @@ test('store: course pictures get a fresh signed link that really loads', async (
   assert.match(head.headers.get('content-type') || '', /^image\//);
   const detail = await (await fetch(`${base}/api/store/courses/${withPic.id}`)).json();
   assert.ok(detail.course.thumbnail_url.includes('X-Amz-Signature'));
+});
+
+test('store: a Full Set shows as separate pictures, free images download without login, a bought Full Set downloads as a zip', async () => {
+  // Full Set keeps several picture links in one field: the shop must split them
+  const fs = await (await fetch(`${base}/api/store/designs?category=full_set&limit=20`)).json();
+  assert.ok(fs.data.every((d) => d.image_url && !/\s/.test(d.image_url)), 'image_url is one single link');
+  const multi = fs.data.find((d) => d.images.length > 1);
+  assert.ok(multi && multi.images[0] === multi.image_url, 'the parts are listed, the first one is the card picture');
+  const butta = await (await fetch(`${base}/api/store/designs?category=butta&limit=2`)).json();
+  assert.ok(butta.data.every((d) => d.images.length === 1 && d.images[0] === d.image_url));
+
+  // free image: no login, only designs priced 0
+  const free = (await pool.query('SELECT id FROM free_image_designs WHERE final_price = 0 ORDER BY id LIMIT 1')).rows[0];
+  const dl = await fetch(`${base}/api/store/free/${free.id}/download`);
+  assert.strictEqual(dl.status, 200);
+  assert.match(dl.headers.get('content-disposition'), /^attachment; filename="free-design-\d+\.bmp"$/);
+  assert.ok((await dl.arrayBuffer()).byteLength > 1000);
+  assert.strictEqual((await fetch(`${base}/api/store/free/999999999/download`)).status, 404);
+  assert.strictEqual((await fetch(`${base}/api/store/free/abc/download`)).status, 404);
+
+  // a bought Full Set with several original files comes as one zip
+  const { signToken } = require('../src/auth');
+  const u = (await pool.query("INSERT INTO users (email, password_hash, full_name) VALUES ('tmp-zip-shopper@example.com', 'x', 'Zip Tester') RETURNING customer_id")).rows[0].customer_id;
+  try {
+    const set = (await pool.query("SELECT id, name, split_part(btrim(image_url), ' ', 1) AS img FROM full_set_designs WHERE original_image_url LIKE '% %' ORDER BY id LIMIT 1")).rows[0];
+    const o = (await pool.query("INSERT INTO orders (customer_id, mobile_number, items_total, platform_fee, total, payment_status, razorpay_order_id, razorpay_payment_id) VALUES ($1,'1',100,0,100,'captured','order_TMPZIP','pay_TMPZIP') RETURNING id", [u])).rows[0].id;
+    const item = (await pool.query("INSERT INTO order_items (order_id, position, design_id, design_category, design_name, image_url, price, final_price) VALUES ($1,1,$2,'full_set',$3,$4,100,100) RETURNING id", [o, set.id, set.name, set.img])).rows[0].id;
+    const auth = { Authorization: `Bearer ${signToken(u)}` };
+    const list = await (await fetch(`${base}/api/store/purchases`, { headers: auth })).json();
+    assert.ok(list.data[0].files > 1 && !/\s/.test(list.data[0].image_url), 'the page gets one picture and the number of files');
+    const zip = await fetch(`${base}/api/store/purchases/${item}/download`, { headers: auth });
+    assert.strictEqual(zip.status, 200);
+    assert.match(zip.headers.get('content-disposition'), /\.zip"$/);
+    const bytes = Buffer.from(await zip.arrayBuffer());
+    assert.strictEqual(bytes.subarray(0, 2).toString(), 'PK', 'it is a real zip file');
+    const { unzipSync } = require('fflate');
+    assert.strictEqual(Object.keys(unzipSync(new Uint8Array(bytes))).length, list.data[0].files);
+  } finally {
+    await pool.query('DELETE FROM orders WHERE customer_id = $1', [u]);
+    await pool.query('DELETE FROM users WHERE customer_id = $1', [u]);
+  }
+});
+
+test('designs: a Full Set can be created with several pictures, other styles stay at one', async () => {
+  const json = { 'Content-Type': 'application/json' };
+  const designer = (await pool.query("SELECT email FROM designers WHERE status = 'active' ORDER BY id LIMIT 1")).rows[0].email;
+  const A = 'https://example.com/a.bmp';
+  const B = 'https://example.com/b.bmp';
+  const base1 = { name: 'TMPFS', designer_email: designer, jacquard_type: 'powerloom', ppi: 68, body_epi: 100, image_type: 'BMP', listing_rate: 10, final_price: 5 };
+  const made = [];
+  try {
+    const ok = await fetch(`${base}/api/designs/full_set`, { method: 'POST', headers: json, body: JSON.stringify({ ...base1, image_url: `${A}  ${B}`, original_image_url: `${A} ${B}` }) });
+    assert.strictEqual(ok.status, 201);
+    const row = await ok.json(); made.push(row.id);
+    assert.strictEqual(row.image_url, `${A} ${B}`, 'extra spaces are tidied');
+    assert.strictEqual((await fetch(`${base}/api/designs/full_set`, { method: 'POST', headers: json, body: JSON.stringify({ ...base1, image_url: `${A} nope`, original_image_url: A }) })).status, 400);
+    assert.strictEqual((await fetch(`${base}/api/designs/full_set`, { method: 'POST', headers: json, body: JSON.stringify({ ...base1, image_url: Array(21).fill(A).join(' '), original_image_url: A }) })).status, 400);
+    // a Butta still takes one link only
+    const weave = { name: 'TMPBU', designer_email: designer, cards: 1, hooks: 1, epi: 1, ppi: 1, image_type: 'BMP', listing_rate: 1, final_price: 1 };
+    const r2 = await fetch(`${base}/api/designs/butta`, { method: 'POST', headers: json, body: JSON.stringify({ ...weave, image_url: `${A} ${B}`, original_image_url: A }) });
+    assert.strictEqual(r2.status, 400);
+    if (r2.status === 201) made.push(null);
+  } finally {
+    for (const id of made.filter(Boolean)) await pool.query('DELETE FROM full_set_designs WHERE id = $1', [id]);
+    await pool.query("DELETE FROM full_set_designs WHERE name = 'TMPFS'");
+    await pool.query("DELETE FROM butta_designs WHERE name = 'TMPBU'");
+  }
+});
+
+test('course enrolment: pay for a package, get access to the lessons, others are kept out (fake Razorpay, throwaway users)', async () => {
+  const bcrypt = require('bcryptjs');
+  const crypto = require('crypto');
+  const http = require('http');
+  const { signToken } = require('../src/auth');
+  const json = { 'Content-Type': 'application/json' };
+  let lastOrder;
+  const fake = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => { lastOrder = JSON.parse(raw); res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ id: `order_TMPK${Date.now()}${Math.floor(Math.random() * 1000)}`, amount: lastOrder.amount })); });
+  });
+  await new Promise((r) => fake.listen(0, r));
+  const saved = { b: process.env.RAZORPAY_API_BASE, s: process.env.RAZORPAY_KEY_SECRET, k: process.env.RAZORPAY_KEY_ID };
+  process.env.RAZORPAY_API_BASE = `http://localhost:${fake.address().port}`;
+  process.env.RAZORPAY_KEY_SECRET = 'tmp_test_secret';
+  process.env.RAZORPAY_KEY_ID = 'rzp_test_TMP';
+  const mk = async (email) => (await pool.query("INSERT INTO users (email, password_hash, full_name, phone) VALUES ($1, $2, 'Tmp Student', '9000000000') RETURNING customer_id", [email, bcrypt.hashSync('x', 4)])).rows[0].customer_id;
+  const buyer = await mk('tmp-enrol-buyer@example.com');
+  const outsider = await mk('tmp-enrol-outsider@example.com');
+  const course = (await pool.query('SELECT id, price::float AS price, certificate_with_price::float AS cert FROM courses WHERE is_published ORDER BY id LIMIT 1')).rows[0];
+  try {
+    const A = { ...json, Authorization: `Bearer ${signToken(buyer)}` };
+    const O = { ...json, Authorization: `Bearer ${signToken(outsider)}` };
+    const checkout = (pack, h = A) => fetch(`${base}/api/store/courses/${course.id}/checkout`, { method: 'POST', headers: h, body: JSON.stringify({ package: pack }) });
+
+    // the public course lists the packages, priced by the server
+    const pub = await (await fetch(`${base}/api/store/courses/${course.id}`)).json();
+    assert.deepStrictEqual(pub.packages.map((p) => p.key), ['basic', 'standard', 'pro', 'elite']);
+    assert.strictEqual(pub.packages[0].price, course.price);
+    assert.strictEqual(pub.packages[1].price, course.cert);
+
+    assert.strictEqual((await checkout('basic', json)).status, 401);
+    assert.strictEqual((await checkout('platinum')).status, 400);
+    assert.strictEqual((await fetch(`${base}/api/store/courses/999999999/checkout`, { method: 'POST', headers: A, body: JSON.stringify({ package: 'basic' }) })).status, 404);
+    for (const p of pub.packages) {
+      const r = await checkout(p.key);
+      assert.strictEqual(r.status, 200);
+      assert.strictEqual((await r.json()).total, p.price, `${p.key} is charged what the server says`);
+      assert.strictEqual(lastOrder.amount, Math.round(p.price * 100));
+    }
+    // pay for Pro
+    const pro = await (await checkout('pro')).json();
+    const pay = `pay_TMPK${Date.now()}`;
+    const sig = (o, p) => crypto.createHmac('sha256', 'tmp_test_secret').update(`${o}|${p}`).digest('hex');
+    const verify = (body, h = A) => fetch(`${base}/api/store/courses/checkout/verify`, { method: 'POST', headers: h, body: JSON.stringify(body) });
+    assert.strictEqual((await verify({ razorpay_order_id: pro.orderId, razorpay_payment_id: pay, razorpay_signature: 'f'.repeat(64) })).status, 400);
+    assert.strictEqual((await pool.query('SELECT COUNT(*)::int AS n FROM enrollments WHERE customer_id = $1', [buyer])).rows[0].n, 0, 'a bad signature enrols nobody');
+    assert.strictEqual((await verify({ razorpay_order_id: pro.orderId, razorpay_payment_id: pay, razorpay_signature: sig(pro.orderId, pay) }, O)).status, 404, 'another shopper cannot confirm it');
+    const ok = await verify({ razorpay_order_id: pro.orderId, razorpay_payment_id: pay, razorpay_signature: sig(pro.orderId, pay) });
+    assert.strictEqual(ok.status, 200);
+    const { enrollmentId, courseId } = await ok.json();
+    assert.strictEqual(String(courseId), String(course.id));
+    const row = (await pool.query('SELECT payment_status, amount_paid::float AS a, certificate_included, doubt_support_included, expires_at > NOW() AS live FROM enrollments WHERE id = $1', [enrollmentId])).rows[0];
+    assert.deepStrictEqual([row.payment_status, row.a, row.certificate_included, row.doubt_support_included, row.live], ['completed', pub.packages[2].price, true, true, true]);
+    const again = await (await verify({ razorpay_order_id: pro.orderId, razorpay_payment_id: pay, razorpay_signature: sig(pro.orderId, pay) })).json();
+    assert.ok(again.already && again.enrollmentId === enrollmentId, 'confirming twice enrols once');
+    // the design checkout cannot be used to confirm a course payment
+    const dsg = await fetch(`${base}/api/store/checkout/verify`, { method: 'POST', headers: A, body: JSON.stringify({ razorpay_order_id: pro.orderId, razorpay_payment_id: 'pay_X', razorpay_signature: sig(pro.orderId, 'pay_X') }) });
+    assert.ok([404, 400].includes(dsg.status));
+    assert.strictEqual((await checkout('basic')).status, 409, 'cannot buy a course twice while enrolled');
+
+    // access
+    assert.strictEqual((await (await fetch(`${base}/api/store/courses/${course.id}/access`, { headers: A })).json()).enrolled, true);
+    assert.strictEqual((await (await fetch(`${base}/api/store/courses/${course.id}/access`, { headers: O })).json()).enrolled, false);
+    const mine = await (await fetch(`${base}/api/store/enrollments/${enrollmentId}`, { headers: A })).json();
+    assert.deepStrictEqual([mine.package, mine.amount, mine.course_id], ['Pro', pub.packages[2].price, String(course.id)]);
+    assert.strictEqual((await fetch(`${base}/api/store/enrollments/${enrollmentId}`, { headers: O })).status, 404, 'not someone else\'s enrolment');
+    const learn = await fetch(`${base}/api/store/learn/${course.id}`, { headers: A });
+    assert.strictEqual(learn.status, 200);
+    const body = await learn.json();
+    assert.ok(body.sections.length > 0 && body.sections[0].videos[0].url, 'the enrolled student gets the lessons with their video links');
+    // ---- progress: a lesson is done at 60%, then the next one opens ----
+    const flat = body.sections.flatMap((s) => s.videos);
+    assert.ok(flat[0].locked === false && flat[0].url, 'the first lesson is open');
+    assert.ok(flat[1].locked === true && flat[1].url === null, 'the second lesson is locked and has no video link');
+    assert.deepStrictEqual([body.progress.completed, body.progress.percent], [0, 0]);
+    const postProgress = (vid, pos, h = A) => fetch(`${base}/api/store/learn/${course.id}/progress`, { method: 'POST', headers: h, body: JSON.stringify({ video_id: Number(vid), position_seconds: pos, duration_seconds: 100 }) });
+    assert.strictEqual((await postProgress(flat[1].id, 50)).status, 403, 'a locked lesson cannot be marked watched');
+    assert.strictEqual((await postProgress(flat[0].id, 50, O)).status, 403, 'not enrolled');
+    const dur0 = flat[0].duration_seconds;
+    const first = await (await postProgress(flat[0].id, dur0)).json();   // claiming the whole video at once
+    assert.ok(first.watched_percent < 60 && first.done === false, 'jumping straight to the end earns nothing: playback has to take time');
+    await pool.query("UPDATE enrollment_video_progress SET last_played_at = NOW() - INTERVAL '200 seconds' WHERE enrollment_id = $1", [enrollmentId]);
+    const second = await (await postProgress(flat[0].id, Math.ceil(dur0 * 0.65))).json();
+    assert.strictEqual(second.done, true, '65% watched over enough time completes the lesson');
+    assert.strictEqual(second.next_unlocked, true);
+    assert.deepStrictEqual([second.progress.completed, second.progress.percent], [1, Math.round(100 / flat.length)]);
+    const reopened = (await (await fetch(`${base}/api/store/learn/${course.id}`, { headers: A })).json()).sections.flatMap((s) => s.videos);
+    assert.ok(reopened[0].done && reopened[1].locked === false && reopened[1].url && reopened[2].locked === true);
+    assert.strictEqual((await pool.query('SELECT progress_percentage FROM enrollments WHERE id = $1', [enrollmentId])).rows[0].progress_percentage, Math.round(100 / flat.length), 'the admin figure follows');
+    // ---- doubt support: the Pro package has it ----
+    const asker = (body, h = A) => fetch(`${base}/api/store/learn/${course.id}/doubts`, { method: 'POST', headers: h, body: JSON.stringify(body) });
+    assert.strictEqual((await fetch(`${base}/api/store/learn/${course.id}/doubts`)).status, 401);
+    assert.strictEqual((await asker({ question: 'How do I start?' }, O)).status, 403, 'not enrolled: cannot ask');
+    assert.strictEqual((await asker({ question: 'hi' })).status, 400, 'too short');
+    assert.strictEqual((await asker({ question: 'x'.repeat(1001) })).status, 400, 'too long');
+    assert.strictEqual((await asker({ question: 'Which lesson is this?', video_id: 999999999 })).status, 400, 'a lesson from elsewhere is refused');
+    assert.strictEqual((await (await fetch(`${base}/api/store/learn/${course.id}`, { headers: A })).json()).doubt_support, true);
+    const q1 = await asker({ question: '  How do I tie the harness for 600 hooks?  ', video_id: flat[0].id });
+    assert.strictEqual(q1.status, 201);
+    const made = await q1.json();
+    assert.deepStrictEqual([made.status, made.answer, made.lesson], ['pending', null, flat[0].title]);
+    assert.strictEqual(made.question, 'How do I tie the harness for 600 hooks?', 'the question is tidied');
+    assert.strictEqual((await asker({ question: 'A question about the whole course' })).status, 201);
+    // the admin answers it from the Doubts page; the student sees the answer
+    const ans = await fetch(`${base}/api/doubts/${made.id}/answer`, { method: 'PUT', headers: json, body: JSON.stringify({ answer: 'Tie the front hooks first.' }) });
+    assert.ok([200, 204].includes(ans.status), `answering works (got ${ans.status})`);
+    const listed = await (await fetch(`${base}/api/store/learn/${course.id}/doubts`, { headers: A })).json();
+    assert.strictEqual(listed.data.length, 2);
+    const mineQ = listed.data.find((d) => String(d.id) === String(made.id));
+    assert.deepStrictEqual([mineQ.status, mineQ.answer], ['answered', 'Tie the front hooks first.']);
+    assert.strictEqual((await (await fetch(`${base}/api/store/learn/${course.id}/doubts`, { headers: O })).json()).data, undefined, 'another student never sees them');
+    // a package without doubt support
+    await pool.query('UPDATE enrollments SET doubt_support_included = FALSE WHERE id = $1', [enrollmentId]);
+    assert.strictEqual((await asker({ question: 'Can I still ask?' })).status, 403);
+    assert.strictEqual((await fetch(`${base}/api/store/learn/${course.id}/doubts`, { headers: A })).status, 403);
+    assert.strictEqual((await (await fetch(`${base}/api/store/learn/${course.id}`, { headers: A })).json()).doubt_support, false);
+    await pool.query('UPDATE enrollments SET doubt_support_included = TRUE WHERE id = $1', [enrollmentId]);
+
+    // ---- reviewing the course ----
+    const putReview = (body, h = A) => fetch(`${base}/api/store/learn/${course.id}/review`, { method: 'PUT', headers: h, body: JSON.stringify(body) });
+    assert.strictEqual((await putReview({ rating: 5 }, json)).status, 401);
+    assert.strictEqual((await putReview({ rating: 5 }, O)).status, 403, 'only enrolled students can review');
+    assert.strictEqual((await putReview({ rating: 0 })).status, 400);
+    assert.strictEqual((await putReview({ rating: 4, review: 'x'.repeat(1001) })).status, 400);
+    assert.strictEqual((await (await fetch(`${base}/api/store/learn/${course.id}`, { headers: A })).json()).my_review, null);
+    assert.strictEqual((await putReview({ rating: 4, review: '  Clear lessons  ' })).status, 200);
+    assert.strictEqual((await putReview({ rating: 5, review: 'Even better than I thought' })).status, 200);
+    const mineRev = (await (await fetch(`${base}/api/store/learn/${course.id}`, { headers: A })).json()).my_review;
+    assert.deepStrictEqual([mineRev.rating, mineRev.review_text], [5, 'Even better than I thought']);
+    assert.strictEqual((await pool.query('SELECT COUNT(*)::int AS n FROM course_reviews WHERE customer_id = $1', [buyer])).rows[0].n, 1, 'editing never makes a second review');
+    assert.strictEqual((await fetch(`${base}/api/store/learn/${course.id}`, { headers: O })).status, 403, 'not enrolled: no lessons');
+    assert.strictEqual((await fetch(`${base}/api/store/learn/${course.id}`)).status, 401);
+    assert.strictEqual((await (await fetch(`${base}/api/store/learn`, { headers: A })).json()).data.length, 1);
+    // access ends with the expiry date
+    await pool.query("UPDATE enrollments SET expires_at = NOW() - INTERVAL '1 day' WHERE id = $1", [enrollmentId]);
+    assert.strictEqual((await fetch(`${base}/api/store/learn/${course.id}`, { headers: A })).status, 403, 'expired access is closed');
+  } finally {
+    await pool.query('DELETE FROM course_doubts WHERE customer_id = ANY($1::bigint[])', [[buyer, outsider]]);
+    await pool.query('DELETE FROM course_reviews WHERE customer_id = ANY($1::bigint[])', [[buyer, outsider]]);
+    await pool.query('DELETE FROM enrollments WHERE customer_id = ANY($1::bigint[])', [[buyer, outsider]]);
+    await pool.query('DELETE FROM checkout_sessions WHERE customer_id = ANY($1::bigint[])', [[buyer, outsider]]);
+    await pool.query('DELETE FROM users WHERE customer_id = ANY($1::bigint[])', [[buyer, outsider]]);
+    fake.close();
+    for (const [k, v] of [['RAZORPAY_API_BASE', saved.b], ['RAZORPAY_KEY_SECRET', saved.s], ['RAZORPAY_KEY_ID', saved.k]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
 });
