@@ -1,0 +1,28 @@
+{
+  "name": "backend",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "migrate": "node src/migrate.js",
+    "import:supabase": "node src/scripts/import-supabase.js",
+    "import:designs": "node src/scripts/import-designs.js",
+    "import:designers": "node src/scripts/import-designers.js",
+    "import:orders": "node src/scripts/import-orders.js",
+    "import:courses": "node src/scripts/import-courses.js",
+    "import:course-content": "node src/scripts/import-course-content.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test tests/*.test.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1169.0",
+    "bcryptjs": "^3.0.3",
+    "dotenv": "^18.0.10",
+    "express": "^5.3.0",
+    "multer": "^2.5.0",
+    "pg": "^8.23.1",
+    "swagger-jsdoc": "^6.3.0",
+    "swagger-ui-express": "^5.0.1"
+  }
+}
