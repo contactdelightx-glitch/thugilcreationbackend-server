@@ -1,5 +1,6 @@
 require('dotenv').config({ quiet: true });
-const { S3Client, ListObjectsV2Command, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, ListObjectsV2Command, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const { AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_BUCKET_NAME, AWS_REGION } = process.env;
 
@@ -105,4 +106,26 @@ async function uploadImage({ originalname, buffer }, folder = '') {
   return { key, name: `${base}.${ext}`, size: buffer.length, url: urlFor(key) };
 }
 
-module.exports = { configured, listImages, uploadImage, isImage, warm, CONTENT_TYPES, COURSE_THUMBNAIL_FOLDER };
+/**
+ * Course pictures imported from the old database are links that were signed for 7 days and have long expired
+ * (and their bucket is private). This returns a freshly signed link for such an S3 address, valid for 6 hours.
+ * Any other address (or no address) is returned unchanged, and so is an address we cannot sign.
+ */
+async function freshUrl(url) {
+  if (!url || !client) return url;
+  let u;
+  try { u = new URL(url); } catch { return url; }
+  const m = /^([a-z0-9.-]+)\.s3[.-]([a-z0-9-]+)\.amazonaws\.com$/i.exec(u.hostname);
+  if (!m || !u.searchParams.has('X-Amz-Signature')) return url; // only the signed, expired kind
+  try {
+    const key = decodeURIComponent(u.pathname.slice(1));
+    const signer = m[2] === AWS_REGION ? client : new S3Client({ region: m[2], credentials: { accessKeyId: AWS_ACCESS_KEY_ID, secretAccessKey: AWS_SECRET_ACCESS_KEY } });
+    return await getSignedUrl(signer, new GetObjectCommand({ Bucket: m[1], Key: key }), { expiresIn: 6 * 60 * 60 });
+  } catch (err) {
+    console.error('freshUrl failed:', err.message);
+    return url;
+  }
+}
+
+module.exports = {
+  freshUrl, configured, listImages, uploadImage, isImage, warm, CONTENT_TYPES, COURSE_THUMBNAIL_FOLDER };

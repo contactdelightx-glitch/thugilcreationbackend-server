@@ -13,6 +13,12 @@ const studentRoutes = require('./routes/students');
 const coursePaymentRoutes = require('./routes/coursePayments');
 const courseRoutes = require('./routes/courses');
 const certificateRoutes = require('./routes/certificates');
+const ratingRoutes = require('./routes/ratings');
+const dashboardRoutes = require('./routes/dashboard');
+const storeRoutes = require('./routes/store');
+const authRoutes = require('./routes/auth');
+const checkoutRoutes = require('./routes/checkout');
+const doubtRoutes = require('./routes/doubts');
 
 const app = express();
 
@@ -36,5 +42,11 @@ app.use(studentRoutes);
 app.use(coursePaymentRoutes);
 app.use(courseRoutes);
 app.use(certificateRoutes);
+app.use(ratingRoutes);
+app.use(dashboardRoutes);
+app.use(storeRoutes);
+app.use(authRoutes);
+app.use(checkoutRoutes);
+app.use(doubtRoutes);
 
 module.exports = app;

@@ -709,3 +709,462 @@ test('certificates: list, filters and summary', async () => {
   assert.deepStrictEqual([...a.data, ...b.data].map((r) => r.enrollment_id), both.data.map((r) => r.enrollment_id));
   assert.strictEqual((await get('/api/certificates?limit=10&offset=6')).hasMore, false);
 });
+
+test('ratings: list, filters and summary', async () => {
+  const get = async (path) => (await fetch(`${base}${path}`)).json();
+
+  const sum = await get('/api/ratings/summary');
+  assert.deepStrictEqual({ ...sum, last30Days: undefined }, {
+    total: 26, average: 5, withReview: 5, forDesigns: 10, general: 16, last30Days: undefined, distribution: { 1: 0, 2: 0, 3: 0, 4: 0, 5: 26 },
+  });
+  assert.ok(Number.isInteger(sum.last30Days));
+
+  const all = await get('/api/ratings?limit=100');
+  assert.strictEqual(all.total, 26);
+  assert.ok(new Date(all.data[0].created_at) >= new Date(all.data[25].created_at)); // newest first
+  assert.ok(all.data.every((r) => r.rating >= 1 && r.rating <= 5));
+  const forDesigns = all.data.filter((r) => r.design_id);
+  assert.strictEqual(forDesigns.length, 10);
+  assert.ok(forDesigns.every((r) => r.design_category && r.design_category_label)); // every design was matched to a category
+  assert.ok(forDesigns.filter((r) => r.design_category !== 'free_image').every((r) => r.design_name)); // and shows its name
+  assert.ok(all.data.filter((r) => !r.design_id).every((r) => !r.design_category && !r.design_name));
+  assert.ok(all.data.every((r) => r.review === null || r.review === r.review.trim())); // reviews are tidy
+
+  assert.strictEqual((await get('/api/ratings?filter=reviewed')).total, 5);
+  assert.strictEqual((await get('/api/ratings?filter=designs')).total, 10);
+  assert.strictEqual((await get('/api/ratings?filter=general')).total, 16);
+  assert.strictEqual((await get('/api/ratings?stars=5')).total, 26);
+  assert.strictEqual((await get('/api/ratings?stars=4')).total, 0);
+  assert.strictEqual((await get('/api/ratings?search=good')).total, 2); // "good deisgns" and "Good"
+  assert.strictEqual((await get('/api/ratings?search=zzzz-nothing')).total, 0);
+  const named = forDesigns.find((r) => r.design_name);
+  assert.ok((await get(`/api/ratings?search=${encodeURIComponent(named.design_name)}`)).data.some((r) => r.id === named.id)); // search finds a design by name
+
+  const a = await get('/api/ratings?limit=7&offset=0');
+  const b = await get('/api/ratings?limit=7&offset=7');
+  const both = await get('/api/ratings?limit=14&offset=0');
+  assert.deepStrictEqual([...a.data, ...b.data].map((r) => r.id), both.data.map((r) => r.id));
+  assert.strictEqual((await get('/api/ratings?limit=10&offset=26')).hasMore, false);
+});
+
+test('doubts: waiting list, answering and filters (throwaway rows)', async () => {
+  const json = { 'Content-Type': 'application/json' };
+  const get = async (path) => (await fetch(`${base}${path}`)).json();
+  const put = (id, body) => fetch(`${base}/api/doubts/${id}/answer`, { method: 'PUT', headers: json, body: JSON.stringify(body) });
+
+  // a student who bought doubt support, one who did not, and a video to ask about
+  const withSupport = (await pool.query(`SELECT customer_id, course_id, student_email FROM enrollments WHERE payment_status = 'completed' AND doubt_support_included LIMIT 1`)).rows[0];
+  const without = (await pool.query(`SELECT customer_id, course_id, student_email FROM enrollments WHERE payment_status = 'completed' AND NOT doubt_support_included LIMIT 1`)).rows[0];
+  const video = (await pool.query('SELECT v.id FROM course_videos v JOIN course_sections s ON s.id = v.section_id WHERE s.course_id = $1 ORDER BY v.id LIMIT 1', [withSupport.course_id])).rows[0];
+  const before = await get('/api/doubts/summary');
+  const ids = [];
+  const add = async (who, question, ago, videoId) => {
+    const r = await pool.query(
+      `INSERT INTO course_doubts (customer_id, student_email, course_id, video_id, question, created_at) VALUES ($1, $2, $3, $4, $5, NOW() - ($6 || ' days')::interval) RETURNING id`,
+      [who.customer_id, who.student_email, who.course_id, videoId, question, String(ago)]
+    );
+    ids.push(r.rows[0].id);
+    return r.rows[0].id;
+  };
+  try {
+    const old = await add(withSupport, 'TMP-DOUBT oldest question', 5, video.id);
+    const recent = await add(without, 'TMP-DOUBT newer question', 1, null);
+
+    const sum = await get('/api/doubts/summary');
+    assert.strictEqual(sum.pending, before.pending + 2);
+    assert.strictEqual(sum.total, before.total + 2);
+
+    // waiting doubts: oldest first, each says whether the student paid for doubt support, and which video it is about
+    const pending = (await get('/api/doubts?status=pending&limit=100')).data.filter((d) => d.question.startsWith('TMP-DOUBT'));
+    assert.deepStrictEqual(pending.map((d) => d.id), [String(old), String(recent)]);
+    assert.strictEqual(pending[0].has_doubt_support, true);
+    assert.strictEqual(pending[1].has_doubt_support, false);
+    assert.ok(pending[0].video_title && pending[0].section_title && pending[0].course_title);
+    assert.strictEqual(pending[1].video_title, null);
+    assert.ok(pending.every((d) => d.status === 'pending' && d.answer === null && d.answered_at === null));
+
+    // answering
+    assert.strictEqual((await put(old, {})).status, 400);
+    assert.strictEqual((await put(old, { answer: '   ' })).status, 400);
+    assert.strictEqual((await put(old, { answer: 'x'.repeat(5001) })).status, 400);
+    assert.strictEqual((await put(999999999, { answer: 'hi' })).status, 404);
+    assert.strictEqual((await put('abc', { answer: 'hi' })).status, 400);
+    const answered = await put(old, { answer: '  Use the Paint Brush tool, then press F7.  ' });
+    assert.strictEqual(answered.status, 200);
+    const body = await answered.json();
+    assert.strictEqual(body.status, 'answered');
+    assert.strictEqual(body.answer, 'Use the Paint Brush tool, then press F7.'); // trimmed
+    assert.ok(body.answered_at);
+
+    // it left the waiting list and is now in the answered list
+    const after = await get('/api/doubts?status=pending&limit=100');
+    assert.ok(!after.data.some((d) => d.id === String(old)) && after.data.some((d) => d.id === String(recent)));
+    const answeredList = (await get('/api/doubts?status=answered&limit=100')).data;
+    assert.ok(answeredList.some((d) => d.id === String(old) && d.answer.startsWith('Use the Paint Brush')));
+    assert.strictEqual((await get('/api/doubts/summary')).pending, before.pending + 1);
+    assert.strictEqual((await get('/api/doubts/summary')).answered, before.answered + 1);
+
+    // changing the answer keeps the original answered time
+    const edited = await (await put(old, { answer: 'Updated answer' })).json();
+    assert.strictEqual(edited.answered_at, body.answered_at);
+    assert.strictEqual(edited.answer, 'Updated answer');
+
+    // search and the "all" order: waiting first, then answered
+    assert.ok((await get('/api/doubts?search=Updated answer')).data.some((d) => d.id === String(old)));
+    assert.strictEqual((await get('/api/doubts?search=zzzz-nothing')).total, 0);
+    const all = (await get('/api/doubts?limit=100')).data.filter((d) => d.question.startsWith('TMP-DOUBT'));
+    assert.deepStrictEqual(all.map((d) => d.status), ['pending', 'answered']);
+
+    // the database itself refuses an "answered" doubt without an answer
+    await assert.rejects(pool.query(`UPDATE course_doubts SET status = 'answered' WHERE id = $1`, [recent]));
+  } finally {
+    await pool.query('DELETE FROM course_doubts WHERE id = ANY($1)', [ids]);
+  }
+  assert.strictEqual((await get('/api/doubts/summary')).total, before.total);
+});
+
+test('courses: edit a course, its sections, software and status (throwaway course)', async () => {
+  const json = { 'Content-Type': 'application/json' };
+  const get = async (path) => (await fetch(`${base}${path}`)).json();
+  const post = (body) => fetch(`${base}/api/courses`, { method: 'POST', headers: json, body: JSON.stringify(body) });
+  const put = (id, body) => fetch(`${base}/api/courses/${id}`, { method: 'PUT', headers: json, body: JSON.stringify(body) });
+  const patchStatus = (id, status) => fetch(`${base}/api/courses/${id}/status`, { method: 'PATCH', headers: json, body: JSON.stringify({ status }) });
+  const T = 'TMP COURSE EDIT TEST';
+  const realBefore = (await get('/api/courses/2')).course;
+  try {
+    const made = await (await post({
+      title: T, instructor_name: 'Old Teacher', price: 1000, certificate_with_price: 1500, language: 'English', access_months: 3, new_category: 'TMP EDIT CAT A',
+      learning_points: ['one', 'two'],
+      sections: [{ title: 'Intro' }, { title: 'Middle' }, { title: 'Last' }],
+      software: [{ name: 'Tool A', download_url: 'https://example.com/a', platform: 'windows', is_required: true }],
+    })).json();
+    const id = made.id;
+    const first = await get(`/api/courses/${id}`);
+    const [s1, s2, s3] = first.sections;
+    const sw = first.software[0];
+    assert.strictEqual(first.course.category_id !== null, true); // the edit form can pre-select the category
+
+    // edit the basics: price, status, category by id, thumbnail, certificate removed
+    const otherCat = (await get('/api/course-categories')).data.find((c) => c.name !== 'TMP EDIT CAT A');
+    const edited = await put(id, { title: `  ${T} (renamed)  `, instructor_name: 'New Teacher', price: 2000, status: 'published', category_id: otherCat.id, language: 'Tamil', access_months: 6, thumbnail_url: 'https://example.com/t.png', description: 'Now described' });
+    assert.strictEqual(edited.status, 200);
+    const c = await edited.json();
+    assert.deepStrictEqual([c.title, c.instructor_name, c.price, c.certificate_with_price, c.certificate_without_price, c.status, c.is_published, c.category, c.language, c.duration_months, c.thumbnail_url],
+      [`${T} (renamed)`, 'New Teacher', 2000, null, 2000, 'published', true, otherCat.name, 'Tamil', 6, 'https://example.com/t.png']);
+    // lists that were left out are untouched
+    const same = await get(`/api/courses/${id}`);
+    assert.deepStrictEqual(same.sections.map((x) => x.title), ['Intro', 'Middle', 'Last']);
+    assert.strictEqual(same.learningPoints.length, 2);
+    assert.strictEqual(same.software.length, 1);
+    // an empty thumbnail removes it; a title that is the course's own is not a duplicate
+    const cleared = await (await put(id, { title: `${T} (renamed)`, instructor_name: 'New Teacher', price: 2000, thumbnail_url: '' })).json();
+    assert.strictEqual(cleared.thumbnail_url, null);
+    assert.strictEqual(cleared.status, 'draft'); // status not sent = draft, like creating
+
+    // learning points replaced; sections renamed, re-ordered, one added, one removed; software changed
+    const base2 = { title: `${T} (renamed)`, instructor_name: 'New Teacher', price: 2000 };
+    const sectionsEdit = await put(id, { ...base2, learning_points: ['only one now'],
+      sections: [{ id: s3.id, title: 'Last (now first)' }, { id: s1.id, title: 'Intro', description: 'described' }, { title: 'Brand new' }],
+      software: [{ id: sw.id, name: 'Tool A v2', download_url: 'https://example.com/a2', platform: 'mac', is_required: false }, { name: 'Tool B', download_url: 'https://example.com/b' }] });
+    assert.strictEqual(sectionsEdit.status, 200);
+    const after = await get(`/api/courses/${id}`);
+    assert.deepStrictEqual(after.sections.map((x) => [x.position, x.title]), [[1, 'Last (now first)'], [2, 'Intro'], [3, 'Brand new']]);
+    assert.strictEqual(after.sections[0].id, s3.id); // same section, just moved: its id is unchanged
+    assert.strictEqual(after.sections[1].description, 'described');
+    assert.ok(!after.sections.some((x) => x.id === s2.id)); // "Middle" had no videos, so it could be removed
+    assert.deepStrictEqual(after.learningPoints.map((p) => p.text), ['only one now']);
+    assert.deepStrictEqual(after.software.map((x) => [x.name, x.platform, x.is_required]), [['Tool A v2', 'mac', false], ['Tool B', null, false]]);
+    assert.strictEqual(after.software[0].id, sw.id);
+
+    // a section that has videos can be renamed and moved, but not removed
+    const vid = await pool.query(`INSERT INTO course_videos (section_id, title, position, duration_seconds) VALUES ($1, 'TMP VIDEO', 1, 60) RETURNING id`, [s3.id]);
+    const blocked = await put(id, { ...base2, sections: [{ title: 'Intro-only' }] });
+    assert.strictEqual(blocked.status, 400);
+    assert.match((await blocked.json()).fields.sections, /has 1 video, so it cannot be removed/);
+    assert.deepStrictEqual((await get(`/api/courses/${id}`)).sections.map((x) => x.title), ['Last (now first)', 'Intro', 'Brand new']); // nothing changed
+    const renamed = await put(id, { ...base2, sections: [{ id: after.sections[1].id, title: 'Intro' }, { id: s3.id, title: 'Renamed, has video' }] });
+    assert.strictEqual(renamed.status, 200);
+    const afterRename = await get(`/api/courses/${id}`);
+    assert.deepStrictEqual(afterRename.sections.map((x) => x.title), ['Intro', 'Renamed, has video']);
+    assert.strictEqual(afterRename.sections[1].videos.length, 1); // the video came along with its section
+
+    // everything can be cleared when nothing is attached
+    const emptied = await put(id, { ...base2, learning_points: [], software: [] });
+    assert.strictEqual(emptied.status, 200);
+    const e = await get(`/api/courses/${id}`);
+    assert.deepStrictEqual([e.learningPoints.length, e.software.length], [0, 0]);
+
+    // validation and protection
+    assert.strictEqual((await put(id, { instructor_name: 'x', price: 1 })).status, 400); // title missing
+    const badBody = await put(id, { title: '', instructor_name: '', price: -1, certificate_with_price: 5, access_months: 0, status: 'weird' });
+    assert.strictEqual(badBody.status, 400);
+    assert.deepStrictEqual(Object.keys((await badBody.json()).fields).sort(), ['access_months', 'instructor_name', 'price', 'status', 'title']); // no certificate message: with an invalid price there is nothing to compare it with
+    const realTitle = realBefore.title;
+    const dup = await put(id, { title: realTitle.toLowerCase(), instructor_name: 'x', price: 1 });
+    assert.strictEqual(dup.status, 400);
+    assert.match((await dup.json()).fields.title, /already used/);
+    const foreign = await put(id, { ...base2, sections: [{ id: 999999999, title: 'nope' }] });
+    assert.strictEqual(foreign.status, 400);
+    const otherCourseSection = (await get('/api/courses/2')).sections[0].id;
+    assert.strictEqual((await put(id, { ...base2, sections: [{ id: otherCourseSection, title: 'steal' }] })).status, 400); // another course's section
+    assert.strictEqual((await put(id, { ...base2, sections: [{ id: afterRename.sections[0].id, title: 'a' }, { id: afterRename.sections[0].id, title: 'b' }] })).status, 400); // same section twice
+    assert.strictEqual((await put(id, { ...base2, id: 5 })).status, 400); // unknown field
+    assert.strictEqual((await put(999999999, base2)).status, 404);
+    assert.strictEqual((await put('abc', base2)).status, 400);
+
+    // publish / take back to draft
+    const pub = await (await patchStatus(id, 'published')).json();
+    assert.deepStrictEqual([pub.status, pub.is_published], ['published', true]);
+    const draft = await (await patchStatus(id, 'draft')).json();
+    assert.deepStrictEqual([draft.status, draft.is_published], ['draft', false]);
+    assert.strictEqual((await patchStatus(id, 'archived')).status, 400);
+    assert.strictEqual((await patchStatus(999999999, 'draft')).status, 404);
+
+    // a real course was not touched by any of this
+    const realAfter = (await get('/api/courses/2')).course;
+    assert.deepStrictEqual([realAfter.title, realAfter.price, realAfter.sections, realAfter.videos, realAfter.updated_at], [realBefore.title, realBefore.price, realBefore.sections, realBefore.videos, realBefore.updated_at]);
+    await pool.query('DELETE FROM course_videos WHERE id = $1', [vid.rows[0].id]);
+  } finally {
+    await pool.query("DELETE FROM courses WHERE title LIKE 'TMP COURSE EDIT TEST%'");
+    await pool.query("DELETE FROM course_categories WHERE name LIKE 'TMP EDIT CAT%'");
+  }
+});
+
+test('courses: edit the videos in a section (details, order, add, remove) on a throwaway course', async () => {
+  const json = { 'Content-Type': 'application/json' };
+  const get = async (path) => (await fetch(`${base}${path}`)).json();
+  const post = (body) => fetch(`${base}/api/courses`, { method: 'POST', headers: json, body: JSON.stringify(body) });
+  const put = (id, body) => fetch(`${base}/api/courses/${id}`, { method: 'PUT', headers: json, body: JSON.stringify(body) });
+  const T = 'TMP COURSE VIDEO TEST';
+  const link = (n) => `https://cdn.example.com/${n}/playlist.m3u8`;
+  const base2 = { title: T, instructor_name: 'Teacher', price: 100 };
+  const realBefore = JSON.stringify((await get('/api/courses/2/curriculum')).sections.map((s) => s.videos.map((v) => [v.id, v.title, v.position])));
+  const realCourseBefore = (await get('/api/courses/2')).course;
+  const anEnrollment = (await pool.query(`SELECT id FROM enrollments ORDER BY id LIMIT 1`)).rows[0].id;
+  try {
+    // videos can be sent when a course is created
+    const made = await (await post({ ...base2, sections: [{ title: 'Sec A', videos: [{ title: 'V1', video_url: link(1), duration_seconds: 600 }, { title: 'V2', duration_seconds: 900 }] }, { title: 'Sec B' }] })).json();
+    const id = made.id;
+    assert.strictEqual(made.duration, '25m'); // 600 + 900 seconds
+    let cur = (await get(`/api/courses/${id}/curriculum`)).sections;
+    const [secA, secB] = cur;
+    assert.deepStrictEqual(secA.videos.map((v) => [v.position, v.title, v.duration_seconds, v.has_video_link]), [[1, 'V1', 600, true], [2, 'V2', 900, false]]);
+    assert.ok(!JSON.stringify(cur).includes('cdn.example.com') && !JSON.stringify(cur).includes('video_url')); // the playback link is never sent back
+    const [v1, v2] = secA.videos;
+
+    // edit details, move V2 above V1, add V3 with a link; the existing link stays when none is sent
+    const edit1 = await put(id, { ...base2, sections: [
+      { id: secA.id, title: 'Sec A', videos: [
+        { id: v2.id, title: 'V2 renamed', description: 'about v2', duration_seconds: 1200, is_free_preview: true, is_published: true },
+        { id: v1.id, title: 'V1', duration_seconds: 600 },
+        { title: 'V3 new', video_url: link(3), duration_seconds: 60 },
+      ] },
+      { id: secB.id, title: 'Sec B' }] });
+    assert.strictEqual(edit1.status, 200);
+    cur = (await get(`/api/courses/${id}/curriculum`)).sections;
+    assert.deepStrictEqual(cur[0].videos.map((v) => [v.position, v.title, v.is_free_preview, v.is_published, v.has_video_link]),
+      [[1, 'V2 renamed', true, true, false], [2, 'V1', false, false, true], [3, 'V3 new', false, false, true]]);
+    assert.strictEqual(cur[0].videos[0].id, v2.id); // same video, just moved: its id is unchanged
+    assert.strictEqual(cur[0].videos[1].id, v1.id);
+    assert.strictEqual((await get(`/api/courses/${id}`)).course.duration, '31m'); // 1200 + 600 + 60 seconds, kept in step
+    const stored = (await pool.query('SELECT video_url FROM course_videos WHERE id = $1', [v1.id])).rows[0].video_url;
+    assert.strictEqual(stored, link(1)); // V1's link was not touched
+    await put(id, { ...base2, sections: [{ id: secA.id, title: 'Sec A', videos: [{ id: v2.id, title: 'V2 renamed', video_url: link('new'), duration_seconds: 1200 }, { id: v1.id, title: 'V1', duration_seconds: 600 }, { id: cur[0].videos[2].id, title: 'V3 new', duration_seconds: 60 }] }, { id: secB.id, title: 'Sec B' }] });
+    assert.strictEqual((await pool.query('SELECT video_url FROM course_videos WHERE id = $1', [v2.id])).rows[0].video_url, link('new')); // a new link replaces the old one
+
+    // a section that sends no "videos" keeps its videos
+    await put(id, { ...base2, sections: [{ id: secA.id, title: 'Sec A (renamed)' }, { id: secB.id, title: 'Sec B' }] });
+    assert.strictEqual((await get(`/api/courses/${id}/curriculum`)).sections[0].videos.length, 3);
+
+    // a video that students watched, or that has a practice file, cannot be removed
+    const v3 = cur[0].videos[2];
+    await pool.query('INSERT INTO enrollment_video_progress (enrollment_id, video_id) VALUES ($1, $2)', [anEnrollment, v1.id]);
+    await pool.query(`INSERT INTO course_resources (course_id, video_id, title) VALUES ($1, $2, 'TMP FILE')`, [id, v3.id]);
+    const info = (await get(`/api/courses/${id}/curriculum`)).sections[0].videos;
+    assert.deepStrictEqual([info[1].watchers, info[2].files], [1, 1]);
+    const keepOnlyV2 = (extra) => ({ ...base2, sections: [{ id: secA.id, title: 'Sec A', videos: [{ id: v2.id, title: 'V2 renamed' }, ...extra] }, { id: secB.id, title: 'Sec B' }] });
+    const watched = await put(id, keepOnlyV2([{ id: v3.id, title: 'V3 new' }]));
+    assert.strictEqual(watched.status, 400);
+    assert.match((await watched.json()).fields.sections, /"V1" cannot be removed: 1 student has watched it/);
+    const hasFile = await put(id, keepOnlyV2([{ id: v1.id, title: 'V1' }]));
+    assert.strictEqual(hasFile.status, 400);
+    assert.match((await hasFile.json()).fields.sections, /"V3 new" cannot be removed: it has 1 practice file/);
+    assert.strictEqual((await get(`/api/courses/${id}/curriculum`)).sections[0].videos.length, 3); // the refused edits changed nothing
+    await pool.query('DELETE FROM enrollment_video_progress WHERE enrollment_id = $1 AND video_id = $2', [anEnrollment, v1.id]);
+    await pool.query('DELETE FROM course_resources WHERE video_id = $1', [v3.id]);
+    const removed = await put(id, keepOnlyV2([]));
+    assert.strictEqual(removed.status, 200);
+    assert.deepStrictEqual((await get(`/api/courses/${id}/curriculum`)).sections[0].videos.map((v) => v.title), ['V2 renamed']);
+    assert.strictEqual((await get(`/api/courses/${id}`)).course.duration, '20m');
+    const kept = (await get(`/api/courses/${id}/curriculum`)).sections[0].videos[0];
+    assert.deepStrictEqual([kept.is_free_preview, kept.is_published, kept.duration_seconds, kept.description], [true, true, 1200, 'about v2']); // not mentioned in the last edit, so unchanged
+
+    // checks
+    const secWith = (videos) => ({ ...base2, sections: [{ id: secA.id, title: 'Sec A', videos }, { id: secB.id, title: 'Sec B' }] });
+    for (const [label, vids] of [
+      ['no title', [{ title: '', description: 'x' }]], ['bad link', [{ title: 'x', video_url: 'ftp://nope' }]], ['bad length', [{ title: 'x', duration_seconds: 99999 }]],
+      ['negative length', [{ title: 'x', duration_seconds: -1 }]], ['same video twice', [{ id: v2.id, title: 'a' }, { id: v2.id, title: 'b' }]],
+      ['video of another section', [{ id: 999999999, title: 'x' }]], ['not a list', 'nope'],
+    ]) assert.strictEqual((await put(id, secWith(vids))).status, 400, label);
+    const realVideo = (await get('/api/courses/2/curriculum')).sections[0].videos[0].id;
+    assert.strictEqual((await put(id, secWith([{ id: realVideo, title: 'steal' }]))).status, 400); // another course's video
+    assert.strictEqual((await put(id, secWith([{}, { title: '' }]))).status, 200); // blank rows are ignored (this empties the section)
+    assert.strictEqual((await get(`/api/courses/${id}/curriculum`)).sections[0].videos.length, 0);
+    assert.strictEqual((await get(`/api/courses/${id}`)).course.duration, null);
+    assert.strictEqual((await fetch(`${base}/api/courses/999999999/curriculum`)).status, 404);
+
+    // the real courses were not touched by any of this
+    assert.strictEqual(JSON.stringify((await get('/api/courses/2/curriculum')).sections.map((s) => s.videos.map((v) => [v.id, v.title, v.position]))), realBefore);
+    const realCourseAfter = (await get('/api/courses/2')).course;
+    assert.deepStrictEqual([realCourseAfter.duration, realCourseAfter.videos, realCourseAfter.updated_at], [realCourseBefore.duration, realCourseBefore.videos, realCourseBefore.updated_at]);
+  } finally {
+    await pool.query('DELETE FROM enrollment_video_progress WHERE enrollment_id = $1 AND video_id IN (SELECT v.id FROM course_videos v JOIN course_sections s ON s.id = v.section_id JOIN courses c ON c.id = s.course_id WHERE c.title LIKE $2)', [anEnrollment, 'TMP COURSE VIDEO TEST%']);
+    await pool.query("DELETE FROM courses WHERE title LIKE 'TMP COURSE VIDEO TEST%'");
+  }
+});
+
+test('store: public designs list by style and never expose private fields', async () => {
+  const cats = await (await fetch(`${base}/api/store/categories`)).json();
+  assert.ok(cats.length === 7 && cats.every((c) => typeof c.count === 'number'));
+  const r = await (await fetch(`${base}/api/store/designs?category=border&limit=5`)).json();
+  assert.ok(r.data.length > 0 && r.data.length <= 5);
+  assert.ok(r.data.every((d) => d.category === 'border' && d.image_url));
+  const keys = new Set(r.data.flatMap((d) => Object.keys(d)));
+  for (const secret of ['designer_email', 'original_image_url', 'notes', 'redirect_url']) assert.ok(!keys.has(secret), `${secret} must not be public`);
+  assert.ok(r.data.every((d) => d.cards > 0 && d.hooks > 0 && d.ppi > 0), 'weaving details are included');
+  const fs = await (await fetch(`${base}/api/store/designs?category=full_set&limit=2`)).json();
+  assert.ok(fs.data.length > 0 && fs.data.every((d) => d.jacquard_type && d.body_epi > 0), 'full set has its own details');
+  const next = await (await fetch(`${base}/api/store/designs?category=border&limit=5&offset=5`)).json();
+  assert.ok(!next.data.some((d) => r.data.some((x) => x.id === d.id)));
+  const all = await (await fetch(`${base}/api/store/designs?limit=3`)).json();
+  assert.strictEqual(all.data.length, 3);
+  assert.strictEqual((await fetch(`${base}/api/store/designs?category=nope`)).status, 400);
+});
+
+test('shopper login and Razorpay checkout (throwaway user, a fake Razorpay server, no real payment)', async () => {
+  const bcrypt = require('bcryptjs');
+  const crypto = require('crypto');
+  const http = require('http');
+  const json = { 'Content-Type': 'application/json' };
+
+  // a stand-in for Razorpay's order API, so the test never touches the live account
+  let lastOrderBody;
+  const fake = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => { lastOrderBody = JSON.parse(raw); res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ id: `order_TMP${Date.now()}`, amount: lastOrderBody.amount })); });
+  });
+  await new Promise((r) => fake.listen(0, r));
+  const saved = { b: process.env.RAZORPAY_API_BASE, s: process.env.RAZORPAY_KEY_SECRET, k: process.env.RAZORPAY_KEY_ID };
+  process.env.RAZORPAY_API_BASE = `http://localhost:${fake.address().port}`;
+  process.env.RAZORPAY_KEY_SECRET = 'tmp_test_secret';
+  process.env.RAZORPAY_KEY_ID = 'rzp_test_TMP';
+
+  const hash = bcrypt.hashSync('Correct-Horse-1', 4);
+  const { rows } = await pool.query(
+    "INSERT INTO users (email, password_hash, full_name, phone) VALUES ('tmp-shopper-test@example.com', $1, 'Tmp Shopper', '9000000000') RETURNING customer_id", [hash]);
+  const id = rows[0].customer_id;
+  try {
+    // ---- login ----
+    assert.strictEqual((await fetch(`${base}/api/auth/login`, { method: 'POST', headers: json, body: JSON.stringify({ email: 'tmp-shopper-test@example.com', password: 'wrong' }) })).status, 401);
+    assert.strictEqual((await fetch(`${base}/api/auth/login`, { method: 'POST', headers: json, body: JSON.stringify({ email: 'nobody@example.com', password: 'x' }) })).status, 401);
+    const ok = await fetch(`${base}/api/auth/login`, { method: 'POST', headers: json, body: JSON.stringify({ email: 'TMP-shopper-test@example.com', password: 'Correct-Horse-1' }) });
+    assert.strictEqual(ok.status, 200);
+    const { token, user } = await ok.json();
+    assert.ok(token && user.full_name === 'Tmp Shopper' && !('password_hash' in user));
+    const auth = { ...json, Authorization: `Bearer ${token}` };
+    assert.strictEqual((await (await fetch(`${base}/api/auth/me`, { headers: auth })).json()).user.email, 'tmp-shopper-test@example.com');
+    assert.strictEqual((await fetch(`${base}/api/auth/me`)).status, 401);
+    assert.strictEqual((await fetch(`${base}/api/auth/me`, { headers: { Authorization: `Bearer ${token.slice(0, -2)}xx` } })).status, 401);
+    await pool.query("UPDATE users SET status = 'suspended' WHERE customer_id = $1", [id]);
+    assert.strictEqual((await fetch(`${base}/api/auth/login`, { method: 'POST', headers: json, body: JSON.stringify({ email: 'tmp-shopper-test@example.com', password: 'Correct-Horse-1' }) })).status, 403);
+    assert.strictEqual((await fetch(`${base}/api/auth/me`, { headers: auth })).status, 401, 'a suspended shopper loses access');
+    await pool.query("UPDATE users SET status = 'active' WHERE customer_id = $1", [id]);
+
+    // ---- checkout ----
+    const post = (path, body, h = auth) => fetch(`${base}${path}`, { method: 'POST', headers: h, body: JSON.stringify(body) });
+    assert.strictEqual((await post('/api/store/checkout', { items: [] }, json)).status, 401);
+    assert.strictEqual((await post('/api/store/checkout', { items: [] })).status, 400);
+    assert.strictEqual((await post('/api/store/checkout', { items: [{ category: 'nope', id: 1 }] })).status, 400);
+
+    const two = (await pool.query("SELECT id, final_price::float AS p FROM border_designs WHERE final_price > 0 ORDER BY id LIMIT 2")).rows;
+    const items = two.map((d) => ({ category: 'border', id: Number(d.id), price: 1 })); // a cheating browser price is ignored
+    const co = await post('/api/store/checkout', { items });
+    assert.strictEqual(co.status, 200);
+    const session = await co.json();
+    const expected = Math.round(two.reduce((n, d) => n + d.p, 0) * 100);
+    assert.strictEqual(session.amount, expected, 'the amount comes from the database');
+    assert.strictEqual(lastOrderBody.amount, expected);
+    assert.strictEqual(session.keyId, 'rzp_test_TMP');
+
+    const payId = `pay_TMP${Date.now()}`;
+    const goodSig = crypto.createHmac('sha256', 'tmp_test_secret').update(`${session.orderId}|${payId}`).digest('hex');
+    const bad = await post('/api/store/checkout/verify', { razorpay_order_id: session.orderId, razorpay_payment_id: payId, razorpay_signature: 'f'.repeat(64) });
+    assert.strictEqual(bad.status, 400);
+    assert.strictEqual((await pool.query('SELECT COUNT(*)::int AS n FROM orders WHERE razorpay_order_id = $1', [session.orderId])).rows[0].n, 0, 'a bad signature saves nothing');
+    const good = await post('/api/store/checkout/verify', { razorpay_order_id: session.orderId, razorpay_payment_id: payId, razorpay_signature: goodSig });
+    assert.strictEqual(good.status, 200);
+    const done = await good.json();
+    const saved1 = (await pool.query('SELECT payment_status, total::float AS total, customer_id::text AS c FROM orders WHERE id = $1', [done.orderId])).rows[0];
+    assert.deepStrictEqual([saved1.payment_status, saved1.total, saved1.c], ['captured', expected / 100, String(id)]);
+    assert.strictEqual((await pool.query('SELECT COUNT(*)::int AS n FROM order_items WHERE order_id = $1', [done.orderId])).rows[0].n, 2);
+    const again = await (await post('/api/store/checkout/verify', { razorpay_order_id: session.orderId, razorpay_payment_id: payId, razorpay_signature: goodSig })).json();
+    assert.ok(again.already && again.orderId === done.orderId, 'confirming twice does not create a second order');
+
+    const rebuy = await post('/api/store/checkout', { items: [items[0]] });
+    assert.strictEqual(rebuy.status, 409, 'a design already bought cannot be bought again');
+  } finally {
+    await pool.query('DELETE FROM orders WHERE customer_id = $1', [id]);
+    await pool.query('DELETE FROM checkout_sessions WHERE customer_id = $1', [id]);
+    await pool.query('DELETE FROM users WHERE customer_id = $1', [id]);
+    fake.close();
+    for (const [k, v] of [['RAZORPAY_API_BASE', saved.b], ['RAZORPAY_KEY_SECRET', saved.s], ['RAZORPAY_KEY_ID', saved.k]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+});
+
+test('store: course summary counts published courses only', async () => {
+  const r = await (await fetch(`${base}/api/store/courses/summary`)).json();
+  for (const k of ['courses', 'videos', 'durationSeconds', 'students', 'reviews']) assert.strictEqual(typeof r[k], 'number', k);
+  const published = (await pool.query('SELECT COUNT(*)::int AS n FROM courses WHERE is_published')).rows[0].n;
+  assert.strictEqual(r.courses, published);
+  const all = (await pool.query('SELECT COUNT(*)::int AS n FROM course_videos')).rows[0].n;
+  assert.ok(r.videos <= all);
+  assert.ok(!('revenue' in r), 'money figures are never public');
+});
+
+test('store: courses list shows published courses only and nothing private', async () => {
+  const r = await (await fetch(`${base}/api/store/courses`)).json();
+  const published = (await pool.query('SELECT COUNT(*)::int AS n FROM courses WHERE is_published')).rows[0].n;
+  assert.strictEqual(r.data.length, published);
+  assert.ok(r.data.every((c) => c.title && typeof c.price === 'number' && typeof c.videos === 'number'));
+  const keys = new Set(r.data.flatMap((c) => Object.keys(c)));
+  for (const secret of ['revenue', 'video_url', 'is_published', 'status']) assert.ok(!keys.has(secret), `${secret} must not be public`);
+  const draft = (await pool.query('SELECT title FROM courses WHERE NOT is_published LIMIT 1')).rows[0];
+  if (draft) assert.ok(!r.data.some((c) => c.title === draft.title), 'a draft course is hidden');
+});
+
+test('store: one course shows its syllabus but no video links, and drafts stay hidden', async () => {
+  const pub = (await pool.query('SELECT id FROM courses WHERE is_published ORDER BY id LIMIT 1')).rows[0];
+  const r = await (await fetch(`${base}/api/store/courses/${pub.id}`)).json();
+  assert.ok(r.course.title && r.sections.length > 0 && r.sections.every((s) => Array.isArray(s.videos)));
+  assert.strictEqual(r.course.videos, r.sections.reduce((n, s) => n + s.videos.length, 0));
+  const text = JSON.stringify(r);
+  for (const secret of ['video_url', 'bunny_video_id', 'download_url', 'revenue', 'is_published']) assert.ok(!text.includes(secret), `${secret} must not be public`);
+  const draft = (await pool.query('SELECT id FROM courses WHERE NOT is_published LIMIT 1')).rows[0];
+  if (draft) assert.strictEqual((await fetch(`${base}/api/store/courses/${draft.id}`)).status, 404);
+  assert.strictEqual((await fetch(`${base}/api/store/courses/999999999`)).status, 404);
+  assert.strictEqual((await fetch(`${base}/api/store/courses/abc`)).status, 404);
+});
+
+test('store: course pictures get a fresh signed link that really loads', async () => {
+  const list = await (await fetch(`${base}/api/store/courses`)).json();
+  const withPic = list.data.find((c) => c.thumbnail_url && c.thumbnail_url.includes('X-Amz-Signature'));
+  if (!withPic) return; // nothing signed to check on this database
+  const stored = (await pool.query('SELECT thumbnail_url FROM courses WHERE id = $1', [withPic.id])).rows[0].thumbnail_url;
+  assert.notStrictEqual(withPic.thumbnail_url, stored, 'the old expired link is replaced');
+  const head = await fetch(withPic.thumbnail_url, { headers: { Range: 'bytes=0-1023' } }); // a signed link works for GET only
+  assert.ok([200, 206].includes(head.status), `the fresh link opens (got ${head.status})`);
+  assert.match(head.headers.get('content-type') || '', /^image\//);
+  const detail = await (await fetch(`${base}/api/store/courses/${withPic.id}`)).json();
+  assert.ok(detail.course.thumbnail_url.includes('X-Amz-Signature'));
+});
