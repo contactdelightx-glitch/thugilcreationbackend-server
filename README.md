@@ -19,6 +19,7 @@ The server runs any new SQL files in `migrations/` every time it starts, so the 
 |---|---|
 | `DATABASE_URL` | PostgreSQL connection string |
 | `PORT` | Port to listen on (default 3001) |
+| `CORS_ORIGIN` | Address(es) of the admin website that may call this API, comma-separated, e.g. `https://thugilcreationadmin-v2.onrender.com`. Needed once the admin is hosted at its own address; leave empty in development |
 | `SUPABASE_URL`, `SUPABASE_SERVICE_KEY` | Only used by the one-off import scripts (they only read from Supabase) |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_BUCKET_NAME`, `AWS_REGION` | S3 bucket for design images and course thumbnails |
 
