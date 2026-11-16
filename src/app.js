@@ -20,6 +20,7 @@ const authRoutes = require('./routes/auth');
 const checkoutRoutes = require('./routes/checkout');
 const learnRoutes = require('./routes/learn');
 const doubtRoutes = require('./routes/doubts');
+const razorpayWebhookRoutes = require('./routes/razorpayWebhook');
 
 const app = express();
 
@@ -30,6 +31,7 @@ const corsOrigins = (process.env.CORS_ORIGIN || '').split(',').map((o) => o.trim
 if (corsOrigins.includes('*')) app.use(cors());
 else if (corsOrigins.length) app.use(cors({ origin: corsOrigins }));
 
+app.use(razorpayWebhookRoutes); // before express.json(): it needs the raw body to check Razorpay's signature
 app.use(express.json());
 app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 app.get('/openapi.json', (req, res) => res.json(swaggerSpec));

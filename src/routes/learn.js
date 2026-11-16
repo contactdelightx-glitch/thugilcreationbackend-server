@@ -1,6 +1,7 @@
 const { Router } = require('express');
 const crypto = require('crypto');
 const pool = require('../db');
+const notify = require('../notify');
 const s3 = require('../s3');
 const { requireUser } = require('../auth');
 const { razorpayKeys, razorpayCreateOrder } = require('../razorpay');
@@ -150,6 +151,7 @@ router.post('/api/store/courses/checkout/verify', requireUser, async (req, res) 
     )).rows[0];
     await client.query('DELETE FROM checkout_sessions WHERE razorpay_order_id = $1', [orderId]);
     await client.query('COMMIT');
+    notify.coursePurchased({ customerId: req.customerId, enrollmentId: e.id, courseId: it.course_id, packageKey: it.package, amount: session.amount, paymentId }); // not awaited: an email problem never fails the payment
     res.json({ enrollmentId: e.id, courseId: it.course_id });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
@@ -419,6 +421,7 @@ router.put('/api/store/learn/:courseId/review', requireUser, async (req, res) =>
        RETURNING rating, review_text`,
       [courseId, req.customerId, user.full_name || null, rating, text || null]
     )).rows[0];
+    pool.query('SELECT title FROM courses WHERE id = $1', [courseId]).then((c) => notify.reviewPosted({ kind: 'course', reviewer: user.full_name, subject: c.rows[0]?.title || `course #${courseId}`, rating, text })).catch(() => {});
     res.json(saved);
   } catch (err) {
     console.error('PUT /api/store/learn/:courseId/review failed:', err.message);
@@ -504,6 +507,7 @@ router.post('/api/store/learn/:courseId/doubts', requireUser, async (req, res) =
        VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, question, answer, status, created_at, answered_at`,
       [req.customerId, user.full_name || null, user.email || 'unknown', a.courseId, videoId, question])).rows[0];
     const lesson = videoId ? (await pool.query('SELECT title FROM course_videos WHERE id = $1', [videoId])).rows[0] : null;
+    notify.doubtAsked({ doubtId: row.id, courseId: a.courseId, studentName: user.full_name, studentEmail: user.email || 'unknown', lesson: lesson ? lesson.title : null, question });
     res.status(201).json({ ...row, lesson: lesson ? lesson.title : null });
   } catch (err) {
     console.error('POST /api/store/learn/:courseId/doubts failed:', err.message);
@@ -559,10 +563,36 @@ router.post('/api/store/learn/:courseId/certificate', requireUser, async (req, r
       [e.id, title, name, email]
     );
     if (!made.rows[0]) return res.status(409).json({ error: 'You have already requested your certificate.' });
+    notify.certificateRequested(e.id);
     res.status(201).json(made.rows[0]);
   } catch (err) {
     console.error('POST /api/store/learn/:courseId/certificate failed:', err.message);
     res.status(500).json({ error: 'Could not send your request. Please try again.' });
+  }
+});
+
+/**
+ * @openapi
+ * /api/store/certificates:
+ *   get:
+ *     tags: [Store]
+ *     summary: Every certificate the logged-in student has earned (issued by the instructor), newest first
+ *     security: [{ bearerAuth: [] }]
+ *     responses:
+ *       200: { description: "{ data: [{ course_id, course_title, certificate_number, full_name, title, issued_at }] }" }
+ *       401: { description: Not logged in }
+ */
+router.get('/api/store/certificates', requireUser, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT e.course_id, c.title AS course_title, cert.certificate_number, cert.full_name, cert.title, cert.issued_at
+         FROM certificates cert JOIN enrollments e ON e.id = cert.enrollment_id JOIN courses c ON c.id = e.course_id
+        WHERE e.customer_id = $1 AND e.payment_status = 'completed' AND cert.status = 'issued'
+        ORDER BY cert.issued_at DESC`, [req.customerId]);
+    res.json({ data: rows });
+  } catch (err) {
+    console.error('GET /api/store/certificates failed:', err.message);
+    res.status(500).json({ error: 'Failed to load your certificates' });
   }
 });
 

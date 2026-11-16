@@ -1,5 +1,6 @@
 const { Router } = require('express');
 const pool = require('../db');
+const notify = require('../notify');
 
 const router = Router();
 const STATUSES = ['pending', 'answered'];
@@ -120,6 +121,7 @@ router.put('/api/doubts/:id/answer', async (req, res) => {
   if (!answer) return res.status(400).json({ error: 'Validation failed', fields: { answer: 'is required' } });
   if (answer.length > MAX_ANSWER) return res.status(400).json({ error: 'Validation failed', fields: { answer: `must be at most ${MAX_ANSWER} characters` } });
   try {
+    const before = (await pool.query('SELECT answer FROM course_doubts WHERE id = $1', [id])).rows[0];
     const { rows } = await pool.query(
       `UPDATE course_doubts
           SET answer = $1, status = 'answered', answered_at = COALESCE(answered_at, NOW()), updated_at = NOW()
@@ -128,6 +130,7 @@ router.put('/api/doubts/:id/answer', async (req, res) => {
       [answer, id]
     );
     if (!rows.length) return res.status(404).json({ error: 'Doubt not found' });
+    if (!before || before.answer !== answer) notify.doubtAnswered(id); // tell the student; saving the same text again sends nothing
     res.json(rows[0]);
   } catch (err) {
     console.error('PUT /api/doubts/:id/answer failed:', err.message);

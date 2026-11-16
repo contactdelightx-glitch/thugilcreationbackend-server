@@ -1,6 +1,7 @@
 const { Router } = require('express');
 const crypto = require('crypto');
 const pool = require('../db');
+const notify = require('../notify');
 const { requireUser } = require('../auth');
 const { zipSync } = require('fflate');
 const { razorpayKeys, razorpayCreateOrder } = require('../razorpay');
@@ -144,6 +145,7 @@ router.post('/api/store/checkout/verify', requireUser, async (req, res) => {
     }
     await client.query('DELETE FROM checkout_sessions WHERE razorpay_order_id = $1', [orderId]);
     await client.query('COMMIT');
+    notify.orderPaid({ customerId: req.customerId, orderId: order.id, total: session.amount, paymentId, items: session.items.map((i) => ({ name: i.name, final_price: i.final_price })) }); // not awaited: an email problem never fails the payment
     res.json({ orderId: order.id, total: session.amount, items: session.items.length });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
@@ -331,6 +333,7 @@ router.put('/api/store/purchases/:itemId/review', requireUser, async (req, res) 
        RETURNING rating, review`,
       [item.design_id, item.design_category, rating, review || null, req.customerId]
     )).rows[0];
+    pool.query('SELECT full_name FROM users WHERE customer_id = $1', [req.customerId]).then((u) => notify.reviewPosted({ kind: 'design', reviewer: u.rows[0]?.full_name, subject: `${item.design_category} design #${item.design_id}`, rating, text: review })).catch(() => {});
     res.json(saved);
   } catch (err) {
     console.error('PUT /api/store/purchases/:itemId/review failed:', err.message);

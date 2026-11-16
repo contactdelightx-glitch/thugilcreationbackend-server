@@ -52,8 +52,11 @@ const publicSelect = (key) => {
 router.get('/api/store/categories', async (req, res) => {
   try {
     const keys = Object.keys(CATEGORIES);
-    const counts = await Promise.all(keys.map((k) => pool.query(`SELECT COUNT(*)::int AS n FROM ${CATEGORIES[k].table}`)));
-    res.json(keys.map((k, i) => ({ key: k, label: CATEGORIES[k].label, count: counts[i].rows[0].n })));
+    // one query (one connection) for all counts: seven parallel queries could use up the database's connection limit
+    const sql = keys.map((k) => `SELECT '${k}' AS key, COUNT(*)::int AS n FROM ${CATEGORIES[k].table}`).join(' UNION ALL ');
+    const { rows } = await pool.query(sql);
+    const n = Object.fromEntries(rows.map((r) => [r.key, r.n]));
+    res.json(keys.map((k) => ({ key: k, label: CATEGORIES[k].label, count: n[k] })));
   } catch (err) {
     console.error('GET /api/store/categories failed:', err.message);
     res.status(500).json({ error: 'Failed to fetch styles' });

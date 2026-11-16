@@ -1,6 +1,7 @@
 const { Router } = require('express');
 const multer = require('multer');
 const pool = require('../db');
+const notify = require('../notify');
 const s3 = require('../s3');
 
 const router = Router();
@@ -154,6 +155,7 @@ router.put('/api/certificates/:enrollmentId/issue', takeFile, async (req, res) =
       [id, `CERT-${Date.now()}-${id}`, ref]
     );
     if (!rows[0]) { await s3.deletePrivate(ref).catch(() => {}); return res.status(409).json({ error: 'This certificate was already issued' }); }
+    notify.certificateIssued(id);
     res.json(rows[0]);
   } catch (err) {
     console.error('PUT /api/certificates/:enrollmentId/issue failed:', err.message);
