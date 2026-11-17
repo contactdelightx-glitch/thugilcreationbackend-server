@@ -192,4 +192,24 @@ const paymentRefunded = safe('paymentRefunded', async ({ paymentId, refundId, am
   await toAdmin(`Refund processed (${paiseToMoney(amountPaise)})`, layout({ eyebrow: 'Admin alert', title: ['Refund', 'processed'], intro: 'Razorpay confirmed a refund. Access to the designs or course is not removed automatically.', detailsTitle: 'Refund details:', rows: [['Customer', user ? `${user.full_name || ''} <${user.email}>` : 'Not known'], ...rows] }), ['admin', 'refund']);
 });
 
-module.exports = { orderPaid, coursePurchased, doubtAsked, doubtAnswered, certificateRequested, certificateIssued, reviewPosted, paymentFailed, paymentRefunded };
+/** a visitor sent a "contact designer" request: thank them, and tell the admin */
+const designRequestReceived = safe('designRequestReceived', async ({ id, name, email, phone, requirement, notes, imageCount, source }) => {
+  await sendMail({
+    to: [{ email, name }], tags: ['design-request'],
+    subject: 'We got your design request',
+    html: layout({
+      eyebrow: greet(name), title: ['Request', 'received'],
+      intro: 'Thank you for contacting our designers. We have your request and will call or write to you soon.',
+      detailsTitle: 'Your request:', rows: [['Request', `#${id}`], ['What you need', requirement], ...(notes ? [['Notes', notes]] : []), ['Phone', phone], ['Pictures attached', String(imageCount)]],
+      nextTitle: ['What happens ', 'next:'], nextPoints: ['Our designer reads your requirement and pictures', 'We contact you on the phone number or email you gave', 'We agree the work and the price with you'],
+    }),
+  });
+  await toAdmin(`New design request from ${name}`, layout({
+    eyebrow: 'Admin alert', title: ['New design', 'request'],
+    intro: `<span style="background:#F2DDA8">${esc(requirement).replace(/\n/g, '<br>')}</span>`,
+    detailsTitle: 'Request details:', rows: [['Name', name], ['Phone', phone], ['Email', email], ...(notes ? [['Notes', notes]] : []), ['Pictures', String(imageCount)], ['Sent from', source === 'app' ? 'the mobile app' : 'the website'], ['Request', `#${id}`]],
+    note: 'See the pictures and update the status in the admin: Design Requests.',
+  }), ['admin', 'design-request']);
+});
+
+module.exports = { designRequestReceived, orderPaid, coursePurchased, doubtAsked, doubtAnswered, certificateRequested, certificateIssued, reviewPosted, paymentFailed, paymentRefunded };
