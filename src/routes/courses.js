@@ -4,6 +4,8 @@ const pool = require('../db');
 const s3 = require('../s3');
 
 const router = Router();
+const bunny = require('../bunny');
+const BUNNY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // the columns shown for a course, in the list and at the top of its detail page
 const COURSE_SELECT = `SELECT c.id, c.title, c.description, c.instructor_name, c.language, c.status, c.is_published, c.thumbnail_url,
@@ -259,6 +261,10 @@ function validateCourse(b) {
         // a field that is not sent stays undefined, so editing a video never resets what it did not mention
         description: x && x.description !== undefined ? text(x.description) : undefined,
         video_url: text(x && x.video_url),
+        // set when the admin uploaded the file to Bunny from the page (see /api/courses/videos/upload)
+        bunny_video_id: text(x && x.bunny_video_id) || undefined,
+        thumbnail_url: text(x && x.thumbnail_url) || undefined,
+        available_resolutions: Array.isArray(x && x.available_resolutions) ? x.available_resolutions.map((r) => String(r).trim()).filter(Boolean).slice(0, 12) : undefined,
         duration_seconds: !x || x.duration_seconds === undefined ? undefined : x.duration_seconds === null || x.duration_seconds === '' ? null : Number(x.duration_seconds),
         is_free_preview: x && x.is_free_preview !== undefined ? Boolean(x.is_free_preview) : undefined,
         is_published: x && x.is_published !== undefined ? Boolean(x.is_published) : undefined,
@@ -271,10 +277,15 @@ function validateCourse(b) {
       if (!x.title || x.title.length > 200) return { error: `${n} needs a title of up to 200 characters` };
       if (x.description && x.description.length > 5000) return { error: `${n}: the description is too long (5000 characters at most)` };
       if (x.video_url && (x.video_url.length > 2000 || !/^https?:\/\//i.test(x.video_url))) return { error: `${n}: the video link must start with http:// or https://` };
+      if (x.bunny_video_id && !BUNNY_ID.test(x.bunny_video_id)) return { error: `${n}: the uploaded video id is not valid` };
+      if (x.bunny_video_id && !x.video_url) return { error: `${n}: an uploaded video needs its video link` };
+      if (x.thumbnail_url && (x.thumbnail_url.length > 2000 || !/^https?:\/\//i.test(x.thumbnail_url))) return { error: `${n}: the picture link must start with http:// or https://` };
       if (x.duration_seconds !== undefined && x.duration_seconds !== null && !(Number.isInteger(x.duration_seconds) && x.duration_seconds >= 0 && x.duration_seconds <= 86400)) return { error: `${n}: the length must be between 0 and 24 hours` };
     }
     const ids = rows.map((x) => x.id).filter((x) => x !== null);
     if (new Set(ids).size !== ids.length) return { error: `${label} lists the same video twice` };
+    const bunnyIds = rows.map((x) => x.bunny_video_id).filter(Boolean);
+    if (new Set(bunnyIds).size !== bunnyIds.length) return { error: `${label} uses the same uploaded video twice` };
     return { rows };
   };
 
@@ -403,6 +414,14 @@ async function applyVideos(client, sectionId, videos) {
       const add = (column, value) => { args.push(value); sets.push(`${column} = $${args.length}`); };
       if (v.description !== undefined) add('description', v.description || null);
       if (v.video_url) add('video_url', v.video_url); // the old link is only replaced by a new one
+      if (v.bunny_video_id) { // a freshly uploaded video replaces the old one: its Bunny id, picture and encoding state go with the link
+        add('bunny_video_id', v.bunny_video_id);
+        if (v.thumbnail_url) add('thumbnail_url', v.thumbnail_url);
+        add('encoding_status', 'completed');
+        add('upload_status', 'completed');
+        add('needs_client_upload', false);
+        add('available_resolutions', v.available_resolutions || []);
+      }
       if (v.duration_seconds !== undefined) add('duration_seconds', v.duration_seconds);
       if (v.is_free_preview !== undefined) add('is_free_preview', v.is_free_preview);
       if (v.is_published !== undefined) add('is_published', v.is_published);
@@ -410,9 +429,11 @@ async function applyVideos(client, sectionId, videos) {
       await client.query(`UPDATE course_videos SET ${sets.join(', ')} WHERE id = $${args.length - 1} AND section_id = $${args.length}`, args);
     } else {
       await client.query(
-        `INSERT INTO course_videos (section_id, title, description, video_url, duration_seconds, position, is_free_preview, is_published)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-        [sectionId, v.title, v.description || null, v.video_url || null, v.duration_seconds ?? null, i + 1, v.is_free_preview ?? false, v.is_published ?? false]
+        `INSERT INTO course_videos (section_id, title, description, video_url, duration_seconds, position, is_free_preview, is_published,
+                                   bunny_video_id, thumbnail_url, encoding_status, upload_status, available_resolutions)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11, $12)`,
+        [sectionId, v.title, v.description || null, v.video_url || null, v.duration_seconds ?? null, i + 1, v.is_free_preview ?? false, v.is_published ?? false,
+         v.bunny_video_id || null, v.bunny_video_id ? v.thumbnail_url || null : null, v.bunny_video_id ? 'completed' : null, v.available_resolutions || []]
       );
     }
   }
@@ -665,6 +686,58 @@ router.patch('/api/courses/:id/status', async (req, res) => {
   } catch (err) {
     console.error('PATCH /api/courses/:id/status failed:', err.message);
     res.status(500).json({ error: 'Failed to change the status' });
+  }
+});
+
+/**
+ * @openapi
+ * /api/courses/videos/upload:
+ *   post:
+ *     tags: [Courses]
+ *     summary: Start a course video upload. Creates the video on Bunny and returns what the browser needs to upload the file straight to Bunny (TUS)
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema: { type: object, required: [title], properties: { title: { type: string } } }
+ *     responses:
+ *       201: { description: "{ bunny_video_id, tus: { endpoint, signature, expires, libraryId, videoId } }" }
+ *       400: { description: No title }
+ *       503: { description: Bunny is not set up on the server }
+ */
+router.post('/api/courses/videos/upload', async (req, res) => {
+  const title = String((req.body && req.body.title) || '').trim();
+  if (!title) return res.status(400).json({ error: 'Give the video a title first' });
+  if (!bunny.isConfigured()) return res.status(503).json({ error: 'Video upload is not set up on the server yet (the Bunny settings are missing)' });
+  try {
+    const id = await bunny.createVideo(title);
+    res.status(201).json({ bunny_video_id: id, tus: bunny.tusSignature(id) });
+  } catch (err) {
+    console.error('POST /api/courses/videos/upload failed:', err.message);
+    res.status(502).json({ error: 'Could not start the upload. Please try again.' });
+  }
+});
+
+/**
+ * @openapi
+ * /api/courses/videos/bunny/{id}:
+ *   get:
+ *     tags: [Courses]
+ *     summary: Where Bunny is with an uploaded video (uploaded, processing with a percentage, completed or failed), and its links and length once ready
+ *     parameters:
+ *       - { in: path, name: id, required: true, schema: { type: string } }
+ *     responses:
+ *       200: { description: "{ bunny_video_id, status, progress, duration_seconds, video_url, thumbnail_url, available_resolutions }" }
+ *       400: { description: Not a video id }
+ */
+router.get('/api/courses/videos/bunny/:id', async (req, res) => {
+  if (!BUNNY_ID.test(req.params.id)) return res.status(400).json({ error: 'Not a video id' });
+  if (!bunny.isConfigured()) return res.status(503).json({ error: 'Video upload is not set up on the server yet' });
+  try {
+    res.json(await bunny.getStatus(req.params.id));
+  } catch (err) {
+    console.error('GET /api/courses/videos/bunny/:id failed:', err.message);
+    res.status(502).json({ error: 'Could not check the video. Please try again.' });
   }
 });
 

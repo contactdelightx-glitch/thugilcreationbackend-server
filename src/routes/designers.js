@@ -16,7 +16,7 @@ const COUNTS = DESIGN_TABLES.map((t) => `SELECT designer_email FROM ${t}`).join(
  * /api/designers/{id}/designs:
  *   get:
  *     tags: [Designers]
- *     summary: The designs one client (designer) has uploaded, newest first: just the design name and its picture
+ *     summary: The designs one client (designer) has uploaded, newest first, with just the design name and its picture
  *     parameters:
  *       - { in: path, name: id, required: true, schema: { type: integer } }
  *       - { in: query, name: search, schema: { type: string }, description: Matches the design name }
