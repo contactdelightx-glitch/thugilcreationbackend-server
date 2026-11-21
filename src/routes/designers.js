@@ -13,6 +13,54 @@ const COUNTS = DESIGN_TABLES.map((t) => `SELECT designer_email FROM ${t}`).join(
 
 /**
  * @openapi
+ * /api/designers/{id}/designs:
+ *   get:
+ *     tags: [Designers]
+ *     summary: The designs one client (designer) has uploaded, newest first: just the design name and its picture
+ *     parameters:
+ *       - { in: path, name: id, required: true, schema: { type: integer } }
+ *       - { in: query, name: search, schema: { type: string }, description: Matches the design name }
+ *       - { in: query, name: offset, schema: { type: integer } }
+ *       - { in: query, name: limit, schema: { type: integer, default: 30, maximum: 100 } }
+ *     responses:
+ *       200: { description: "{ designer: { id, email }, data: [{ id, category, name, image_url }], total, hasMore }" }
+ *       404: { description: No such client }
+ */
+router.get('/api/designers/:id/designs', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) return res.status(404).json({ error: 'Client not found' });
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 30, 1), 100);
+  const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+  const search = String(req.query.search || '').trim();
+  try {
+    const designer = (await pool.query('SELECT id, email FROM designers WHERE id = $1', [id])).rows[0];
+    if (!designer) return res.status(404).json({ error: 'Client not found' });
+
+    // the same columns from every design table (free images have no name); only a table name from the fixed list reaches the SQL
+    const all = DESIGN_TABLES.map((t) => {
+      const key = t.replace(/_designs$/, '');
+      const name = key === 'free_image' ? 'NULL::varchar' : 'name';
+      return `SELECT id, '${key}' AS category, ${name} AS name, split_part(btrim(image_url), ' ', 1) AS image_url, created_at, designer_email FROM ${t}`;
+    }).join(' UNION ALL ');
+    const params = [designer.email];
+    let clause = 'WHERE LOWER(designer_email) = LOWER($1)';
+    if (search) { params.push(`%${search}%`); clause += ` AND name ILIKE $${params.length}`; }
+
+    const total = (await pool.query(`SELECT COUNT(*)::int AS n FROM (${all}) x ${clause}`, params)).rows[0].n;
+    const { rows } = await pool.query(
+      `SELECT id, category, name, image_url FROM (${all}) x ${clause}
+        ORDER BY created_at DESC, id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, limit, offset]
+    );
+    res.json({ designer, data: rows, offset, limit, total, hasMore: offset + rows.length < total });
+  } catch (err) {
+    console.error('GET /api/designers/:id/designs failed:', err.message);
+    res.status(500).json({ error: 'Failed to fetch the client’s designs' });
+  }
+});
+
+/**
+ * @openapi
  * /api/designers:
  *   get:
  *     tags: [Designers]

@@ -1,5 +1,6 @@
 const { Router } = require('express');
 const pool = require('../db');
+const { zipSync } = require('fflate');
 
 const router = Router();
 
@@ -31,6 +32,55 @@ const fullSelect = (key) => {
   const name = key === 'free_image' ? 'NULL::varchar AS name, ' : '';
   return `SELECT *, ${name}'${key}' AS category FROM ${table}`;
 };
+
+/**
+ * @openapi
+ * /api/designs/{category}/{id}/download:
+ *   get:
+ *     tags: [Designs]
+ *     summary: Download a design's original file (a Full Set with several files comes as one zip)
+ *     parameters:
+ *       - { in: path, name: category, required: true, schema: { type: string } }
+ *       - { in: path, name: id, required: true, schema: { type: integer } }
+ *     responses:
+ *       200: { description: The file, as an attachment }
+ *       404: { description: No such design }
+ *       502: { description: The file could not be fetched }
+ */
+router.get('/api/designs/:category/:id/download', async (req, res) => {
+  const key = req.params.category;
+  const id = Number(req.params.id);
+  if (!CATEGORIES[key] || !Number.isInteger(id) || id < 1) return res.status(404).json({ error: 'Design not found' });
+  try {
+    const nameCol = key === 'free_image' ? 'NULL::varchar' : 'name';
+    const row = (await pool.query(`SELECT ${nameCol} AS name, original_image_url, image_url FROM ${CATEGORIES[key].table} WHERE id = $1`, [id])).rows[0];
+    if (!row) return res.status(404).json({ error: 'Design not found' });
+    const files = String(row.original_image_url || row.image_url || '').trim().split(/\s+/).filter(Boolean);
+    if (!files.length) return res.status(404).json({ error: 'This design has no file' });
+    const safe = String(row.name || `${key}-${id}`).replace(/[^A-Za-z0-9._-]+/g, '_');
+    const extOf = (u) => { try { return (new URL(u).pathname.match(/\.([a-z0-9]{2,5})$/i) || [, 'bmp'])[1].toLowerCase(); } catch { return 'bmp'; } };
+    res.setHeader('Cache-Control', 'private, no-store');
+    if (files.length === 1) {
+      const f = await fetch(files[0]);
+      if (!f.ok) return res.status(502).json({ error: 'The design file could not be fetched' });
+      res.setHeader('Content-Type', f.headers.get('content-type') || 'application/octet-stream');
+      res.setHeader('Content-Disposition', `attachment; filename="${safe}.${extOf(files[0])}"`);
+      return res.send(Buffer.from(await f.arrayBuffer()));
+    }
+    const entries = {};
+    for (const [n, url] of files.entries()) {
+      const f = await fetch(url);
+      if (!f.ok) return res.status(502).json({ error: 'A design file could not be fetched' });
+      entries[`${safe}-${n + 1}.${extOf(url)}`] = new Uint8Array(await f.arrayBuffer());
+    }
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${safe}.zip"`);
+    res.send(Buffer.from(zipSync(entries, { level: 6 })));
+  } catch (err) {
+    console.error('GET /api/designs/:category/:id/download failed:', err.message);
+    res.status(500).json({ error: 'Download failed. Please try again.' });
+  }
+});
 
 /**
  * @openapi
