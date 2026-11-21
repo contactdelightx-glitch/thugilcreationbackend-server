@@ -156,6 +156,7 @@ router.get('/api/courses/:id/curriculum', async (req, res) => {
       pool.query('SELECT id, title, description, position, is_published FROM course_sections WHERE course_id = $1 ORDER BY position, id', [id]),
       pool.query(
         `SELECT v.id, v.section_id, v.title, v.description, v.duration_seconds, v.position, v.is_free_preview, v.is_published,
+                v.thumbnail_url,
                 (v.video_url IS NOT NULL AND v.video_url <> '') AS has_video_link,
                 (SELECT COUNT(*) FROM enrollment_video_progress p WHERE p.video_id = v.id)::int AS watchers,
                 (SELECT COUNT(*) FROM course_resources r WHERE r.video_id = v.id)::int AS files
@@ -738,6 +739,32 @@ router.get('/api/courses/videos/bunny/:id', async (req, res) => {
   } catch (err) {
     console.error('GET /api/courses/videos/bunny/:id failed:', err.message);
     res.status(502).json({ error: 'Could not check the video. Please try again.' });
+  }
+});
+
+/**
+ * @openapi
+ * /api/courses/videos/{id}/source:
+ *   get:
+ *     tags: [Courses]
+ *     summary: Where to play one course video (its stream link and picture), for the admin's preview
+ *     parameters:
+ *       - { in: path, name: id, required: true, schema: { type: integer } }
+ *     responses:
+ *       200: { description: "{ id, title, video_url, thumbnail_url, duration_seconds }" }
+ *       404: { description: No such video, or it has no video link }
+ */
+router.get('/api/courses/videos/:id/source', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) return res.status(404).json({ error: 'Video not found' });
+  try {
+    const v = (await pool.query('SELECT id, title, video_url, thumbnail_url, duration_seconds FROM course_videos WHERE id = $1', [id])).rows[0];
+    if (!v || !v.video_url) return res.status(404).json({ error: 'This video has no link yet' });
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(v);
+  } catch (err) {
+    console.error('GET /api/courses/videos/:id/source failed:', err.message);
+    res.status(500).json({ error: 'Could not load the video' });
   }
 });
 
