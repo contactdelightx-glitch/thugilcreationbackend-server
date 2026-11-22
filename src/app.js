@@ -21,6 +21,7 @@ const checkoutRoutes = require('./routes/checkout');
 const learnRoutes = require('./routes/learn');
 const doubtRoutes = require('./routes/doubts');
 const razorpayWebhookRoutes = require('./routes/razorpayWebhook');
+const designPackageRoutes = require('./routes/designPackages');
 const designRequestRoutes = require('./routes/designRequests');
 
 const app = express();
@@ -53,6 +54,7 @@ app.use(authRoutes);
 app.use(checkoutRoutes);
 app.use(learnRoutes);
 app.use(doubtRoutes);
+app.use(designPackageRoutes);
 app.use(designRequestRoutes);
 
 module.exports = app;

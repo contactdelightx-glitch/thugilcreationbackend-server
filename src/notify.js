@@ -193,23 +193,68 @@ const paymentRefunded = safe('paymentRefunded', async ({ paymentId, refundId, am
 });
 
 /** a visitor sent a "contact designer" request: thank them, and tell the admin */
-const designRequestReceived = safe('designRequestReceived', async ({ id, name, email, phone, requirement, notes, imageCount, source }) => {
+const designRequestReceived = safe('designRequestReceived', async ({ id, name, email, phone, requirement, notes, imageCount, source, packageName, deliveryDays, costPercent }) => {
   await sendMail({
     to: [{ email, name }], tags: ['design-request'],
     subject: 'We got your design request',
     html: layout({
       eyebrow: greet(name), title: ['Request', 'received'],
-      intro: 'Thank you for contacting our designers. We have your request and will call or write to you soon.',
-      detailsTitle: 'Your request:', rows: [['Request', `#${id}`], ['What you need', requirement], ...(notes ? [['Notes', notes]] : []), ['Phone', phone], ['Pictures attached', String(imageCount)]],
-      nextTitle: ['What happens ', 'next:'], nextPoints: ['Our designer reads your requirement and pictures', 'We contact you on the phone number or email you gave', 'We agree the work and the price with you'],
+      intro: `Thank you for contacting our designers. We have your work and will call or write to you soon.${deliveryDays ? ` Under your ${esc(packageName)} package it takes up to <strong>${deliveryDays} ${deliveryDays === 1 ? 'day' : 'days'}</strong>.` : ''}`,
+      detailsTitle: 'Your work:', rows: [['Request', `#${id}`], ...(packageName ? [['Package', `${packageName}${costPercent ? ` (${costPercent}% of the normal cost)` : ''}`]] : []), ['What you need', requirement], ...(notes ? [['Notes', notes]] : []), ['Phone', phone], ['Pictures attached', String(imageCount)]],
+      nextTitle: ['What happens ', 'next:'], nextPoints: ['Our designer reads your requirement and pictures', 'We contact you on the phone number or email you gave', 'You can follow the progress in the app or on the website'],
     }),
   });
   await toAdmin(`New design request from ${name}`, layout({
     eyebrow: 'Admin alert', title: ['New design', 'request'],
     intro: `<span style="background:#F2DDA8">${esc(requirement).replace(/\n/g, '<br>')}</span>`,
-    detailsTitle: 'Request details:', rows: [['Name', name], ['Phone', phone], ['Email', email], ...(notes ? [['Notes', notes]] : []), ['Pictures', String(imageCount)], ['Sent from', source === 'app' ? 'the mobile app' : 'the website'], ['Request', `#${id}`]],
+    detailsTitle: 'Request details:', rows: [['Name', name], ['Phone', phone], ['Email', email], ...(notes ? [['Notes', notes]] : []), ['Pictures', String(imageCount)], ['Sent from', source === 'app' ? 'the mobile app' : 'the website'], ...(packageName ? [['Package', `${packageName}: ${costPercent}% of the cost, ${deliveryDays} days`]] : []), ['Request', `#${id}`]],
     note: 'See the pictures and update the status in the admin: Design Requests.',
   }), ['admin', 'design-request']);
 });
 
-module.exports = { designRequestReceived, orderPaid, coursePurchased, doubtAsked, doubtAnswered, certificateRequested, certificateIssued, reviewPosted, paymentFailed, paymentRefunded };
+const STEP = { new: 'Received', contacted: 'Contacted', in_progress: 'In progress', review: 'Ready for your review', done: 'Delivered' };
+
+/** a customer bought a Contact designer package */
+const designPackageBought = safe('designPackageBought', async ({ customerId, subscriptionId, paymentId }) => {
+  const user = await customerOf(customerId);
+  const s = (await pool.query('SELECT package_name, price_paid, cost_percent, delivery_days, max_requests, expires_at FROM design_subscriptions WHERE id = $1', [subscriptionId])).rows[0];
+  if (!s) return;
+  const rows = [['Package', s.package_name], ['Paid', money(s.price_paid)], ['Work cost', `${s.cost_percent}% of the normal cost`], ['Delivery', `${s.delivery_days} ${s.delivery_days === 1 ? 'day' : 'days'} per work`], ['Number of works', s.max_requests ? String(s.max_requests) : 'As many as you like'], ['Valid until', day(s.expires_at)], ...(paymentId ? [['Payment id', paymentId]] : [])];
+  if (user?.email) {
+    await sendMail({
+      to: [{ email: user.email, name: user.full_name }], tags: ['design-package'],
+      subject: `Your ${s.package_name} package is active`,
+      html: layout({
+        topLink: { label: 'Send my work to the designer', url: link('#Contact') },
+        eyebrow: greet(user.full_name), title: ['Package', 'activated'],
+        intro: 'Thank you. You can now send your design work to our designer under this package.',
+        button: { label: 'Send my work', url: link('#Contact') },
+        detailsTitle: 'Your package:', rows,
+        nextTitle: ['How it ', 'works:'], nextPoints: ['Open Contact designer and describe the work, with up to 2 pictures', 'The designer starts and you see each step as it moves forward', 'Your work is delivered within the days above'],
+      }),
+    });
+  }
+  await toAdmin(`New design package: ${s.package_name} (${money(s.price_paid)})`, layout({ eyebrow: 'Admin alert', title: ['New package', 'bought'], intro: `${esc(user?.full_name || 'A customer')} bought a Contact designer package.`, detailsTitle: 'Package details:', rows: [['Customer', `${user?.full_name || 'Unknown'} <${user?.email || 'no email'}>`], ...rows] }), ['admin', 'design-package']);
+});
+
+/** the designer moved a work to its next step, or sent a message about it */
+const designRequestUpdated = safe('designRequestUpdated', async ({ id, status, message, statusChanged, fileCount = 0 }) => {
+  const r = (await pool.query(
+    `SELECT r.name, r.email, r.requirement, r.package_name, to_char(r.due_date, 'DD Mon YYYY') AS due, r.quoted_price, r.normal_cost, r.cost_percent
+       FROM design_requests r WHERE r.id = $1`, [id])).rows[0];
+  if (!r || !r.email) return;
+  const rows = [['Work', r.requirement.length > 90 ? `${r.requirement.slice(0, 90)}…` : r.requirement], ['Step', STEP[status]], ...(fileCount ? [['Files', `${fileCount} finished ${fileCount === 1 ? 'file is' : 'files are'} ready to download`]] : []), ...(r.due ? [['Due by', r.due]] : []), ...(r.quoted_price != null ? [['Your price', `${money(r.quoted_price)}${r.cost_percent && r.cost_percent < 100 ? ` (${r.cost_percent}% of ${money(r.normal_cost)})` : ''}`]] : [])];
+  await sendMail({
+    to: [{ email: r.email, name: r.name }], tags: ['design-update'],
+    subject: fileCount && !statusChanged ? 'Your design files are ready' : statusChanged ? `Your design work: ${STEP[status]}` : 'A message about your design work',
+    html: layout({
+      topLink: { label: 'See my work', url: link('#Contact') },
+      eyebrow: greet(r.name), title: statusChanged ? ['Your work is', STEP[status].toLowerCase()] : ['A message about', 'your work'],
+      intro: message ? `<span style="background:#F2DDA8">${esc(message).replace(/\n/g, '<br>')}</span>` : status === 'done' ? 'Your design work is finished. Thank you for choosing us.' : 'There is an update on your design work.',
+      button: { label: 'See my work', url: link('#Contact') },
+      detailsTitle: 'Your work:', rows,
+    }),
+  });
+});
+
+module.exports = { designPackageBought, designRequestUpdated, designRequestReceived, orderPaid, coursePurchased, doubtAsked, doubtAnswered, certificateRequested, certificateIssued, reviewPosted, paymentFailed, paymentRefunded };

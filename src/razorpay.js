@@ -20,4 +20,14 @@ async function razorpayCreateOrder({ amountPaise, receipt }) {
   return body;
 }
 
-module.exports = { razorpayKeys, razorpayCreateOrder };
+const crypto = require('crypto');
+
+/** Razorpay signs "order_id|payment_id" with the key secret; only a real payment has a matching signature */
+function verifyPaymentSignature(orderId, paymentId, signature) {
+  const { secret } = razorpayKeys();
+  const expected = Buffer.from(crypto.createHmac('sha256', secret).update(`${orderId}|${paymentId}`).digest('hex'));
+  const given = Buffer.from(String(signature || ''));
+  return expected.length === given.length && crypto.timingSafeEqual(expected, given);
+}
+
+module.exports = { razorpayKeys, razorpayCreateOrder, verifyPaymentSignature };
